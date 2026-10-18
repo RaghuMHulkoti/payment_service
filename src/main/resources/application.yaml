@@ -25,6 +25,9 @@ spring:
     default-schema: PAYMENT
 
 server:
+  tomcat:
+    mbeanregistry:
+      enabled: true
   port: ${SERVER_PORT:8085}
 
 payment:
@@ -55,10 +58,22 @@ springdoc:
   show-actuator: false
 
 management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        http.client.requests: true
+    data:
+      repository:
+        autotime:
+          enabled: true
+          percentiles-histogram: true
   endpoints:
     web:
       exposure:
-        include: health,metrics
+        include: health,metrics,prometheus
   endpoint:
     health:
       probes:
