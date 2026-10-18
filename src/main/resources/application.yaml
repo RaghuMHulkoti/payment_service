@@ -1,0 +1,66 @@
+spring:
+  application:
+    name: payment-service
+  datasource:
+    url: jdbc:oracle:thin:@ecommerce_tp?TNS_ADMIN=${WALLET_DIR:/Users/raghavendra/Downloads/Wallet_ECOMMERCE}
+    username: ${DB_USERNAME:ADMIN}
+    password: ${DB_PASSWORD}
+    driver-class-name: oracle.jdbc.OracleDriver
+    hikari:
+      connection-test-query: SELECT 1 FROM DUAL
+      connection-init-sql: ALTER SESSION SET CURRENT_SCHEMA=PAYMENT
+      maximum-pool-size: 2
+      minimum-idle: 0
+      connection-timeout: 30000
+      idle-timeout: 600000
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: PAYMENT
+    default-schema: PAYMENT
+
+server:
+  port: ${SERVER_PORT:8085}
+
+payment:
+  # 3x exponential retry on transient PSP errors (TDD §14.6)
+  provider-max-attempts: 3
+  provider-backoff: 200ms
+  # intents stuck in INITIATED / REQUIRES_ACTION longer than this are reconciled against the PSP (TDD §14.6)
+  stuck-after: 1h
+  jobs:
+    enabled: true
+    webhook-poll-interval: 5s
+    reconcile-interval: 15m
+  # Webhooks are rejected (fail closed) while a provider's secret is empty.
+  stripe:
+    webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+    webhook-tolerance: 5m
+  razorpay:
+    webhook-secret: ${RAZORPAY_WEBHOOK_SECRET:}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    tagsSorter: alpha
+    operationsSorter: alpha
+    tryItOutEnabled: true
+  show-actuator: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
