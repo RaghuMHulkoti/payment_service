@@ -4,9 +4,11 @@ import com.learning.payment_service.core.domain.PaymentIntent;
 import com.learning.payment_service.core.domain.Provider;
 import com.learning.payment_service.core.processor.ConfirmIntentProcessor;
 import com.learning.payment_service.core.processor.CreateIntentProcessor;
+import com.learning.payment_service.core.processor.CreateIntentProcessorResponse;
 import com.learning.payment_service.core.processor.CreateRefundProcessor;
 import com.learning.payment_service.core.processor.GetPaymentProcessor;
 import com.learning.payment_service.core.processor.ReceiveWebhookProcessor;
+import com.learning.payment_service.core.processor.ReceiveWebhookProcessorResponse;
 import com.learning.payment_service.exception.BusinessRuleViolationException;
 import com.learning.payment_service.exception.GlobalExceptionHandler;
 import com.learning.payment_service.exception.InvalidWebhookException;
@@ -67,7 +69,7 @@ class PaymentControllerTest {
     @Test
     void createReturns201WithTheClientSecretOnFirstCallAnd200OnReplay() throws Exception {
         var intent = intent();
-        when(create.process(any())).thenReturn(new CreateIntentProcessor.Response(intent, "secret_1", true));
+        when(create.process(any())).thenReturn(new CreateIntentProcessorResponse(intent, "secret_1", true));
         mvc.perform(post("/api/v1/internal/payments/intents").header("Idempotency-Key", "k")
                         .contentType(MediaType.APPLICATION_JSON).content(body()))
                 .andExpect(status().isCreated())
@@ -75,7 +77,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.body.clientSecret").value("secret_1"))
                 .andExpect(jsonPath("$.body.paymentId").value(intent.id().toString()));
 
-        when(create.process(any())).thenReturn(new CreateIntentProcessor.Response(intent, "secret_1", false));
+        when(create.process(any())).thenReturn(new CreateIntentProcessorResponse(intent, "secret_1", false));
         mvc.perform(post("/api/v1/internal/payments/intents").header("Idempotency-Key", "k")
                         .contentType(MediaType.APPLICATION_JSON).content(body()))
                 .andExpect(status().isOk());
@@ -111,7 +113,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.body.errorCode").value("INVALID_SIGNATURE"));
 
         Mockito.reset(webhook);
-        when(webhook.process(any())).thenReturn(new ReceiveWebhookProcessor.Response(false));
+        when(webhook.process(any())).thenReturn(new ReceiveWebhookProcessorResponse(false));
         mvc.perform(post("/api/v1/webhooks/razorpay").contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isOk());
     }

@@ -1,10 +1,7 @@
 package com.learning.payment_service.web;
 
+import com.learning.payment_service.core.processor.*;
 import com.learning.payment_service.common.StatusCode;
-import com.learning.payment_service.core.processor.ConfirmIntentProcessor;
-import com.learning.payment_service.core.processor.CreateIntentProcessor;
-import com.learning.payment_service.core.processor.CreateRefundProcessor;
-import com.learning.payment_service.core.processor.GetPaymentProcessor;
 import com.learning.payment_service.web.request.ConfirmIntentRequest;
 import com.learning.payment_service.web.request.CreateIntentRequest;
 import com.learning.payment_service.web.request.CreateRefundRequest;
@@ -60,21 +57,22 @@ public class PaymentController {
             @Parameter(description = "Unique per payment request, e.g. order_<orderId>")
             @RequestHeader(IDEMPOTENCY_HEADER) String idempotencyKey,
             @Valid @RequestBody CreateIntentRequest request) {
-        var result = createIntentProcessor.process(new CreateIntentProcessor.Request(idempotencyKey,
-                request.orderId(), request.customerId(), request.amount(), request.currency(), request.provider()));
-        var body = PaymentResponseMapper.toResponse(result.intent(), result.clientSecret(), List.of());
-        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
+        var result = createIntentProcessor.process(new CreateIntentProcessorRequest(idempotencyKey,
+                request.getOrderId(), request.getCustomerId(), request.getAmount(), request.getCurrency(),
+                request.getProvider()));
+        var body = PaymentResponseMapper.toResponse(result.getIntent(), result.getClientSecret(), List.of());
+        return ResponseEntity.status(result.isCreated() ? HttpStatus.CREATED : HttpStatus.OK)
                 .body(new Response<>(StatusCode.SUCCESS,
-                        result.created() ? "Payment intent created" : "Payment intent already exists", body));
+                        result.isCreated() ? "Payment intent created" : "Payment intent already exists", body));
     }
 
     @PostMapping("/internal/payments/intents/{id}/confirm")
     @Operation(summary = "Server-side confirm of an intent with a payment method token (optional path)")
     public ResponseEntity<Response<PaymentResponse>> confirm(@PathVariable UUID id,
                                                              @Valid @RequestBody ConfirmIntentRequest request) {
-        var result = confirmIntentProcessor.process(new ConfirmIntentProcessor.Request(id, request.paymentMethodToken()));
-        return ok("Payment " + result.intent().status().name().toLowerCase().replace('_', ' '),
-                PaymentResponseMapper.toResponse(result.intent(), null, List.of()));
+        var result = confirmIntentProcessor.process(new ConfirmIntentProcessorRequest(id, request.getPaymentMethodToken()));
+        return ok("Payment " + result.getIntent().status().name().toLowerCase().replace('_', ' '),
+                PaymentResponseMapper.toResponse(result.getIntent(), null, List.of()));
     }
 
     @PostMapping("/internal/payments/refunds")
@@ -82,22 +80,22 @@ public class PaymentController {
     public ResponseEntity<Response<RefundResponse>> refund(
             @RequestHeader(IDEMPOTENCY_HEADER) String idempotencyKey,
             @Valid @RequestBody CreateRefundRequest request) {
-        var result = createRefundProcessor.process(new CreateRefundProcessor.Request(idempotencyKey,
-                request.orderId(), request.amount(), request.reason()));
-        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
+        var result = createRefundProcessor.process(new CreateRefundProcessorRequest(idempotencyKey,
+                request.getOrderId(), request.getAmount(), request.getReason()));
+        return ResponseEntity.status(result.isCreated() ? HttpStatus.CREATED : HttpStatus.OK)
                 .body(new Response<>(StatusCode.SUCCESS,
-                        result.created() ? "Refund " + result.refund().status().name().toLowerCase()
+                        result.isCreated() ? "Refund " + result.getRefund().status().name().toLowerCase()
                                 : "Refund already exists",
-                        PaymentResponseMapper.toResponse(result.refund())));
+                        PaymentResponseMapper.toResponse(result.getRefund())));
     }
 
     @GetMapping("/payments/{id}")
     @Operation(summary = "Payment status; only the owning customer can read it")
     public ResponseEntity<Response<PaymentResponse>> get(
             @Parameter(hidden = true) @RequestHeader(USER_HEADER) UUID userId, @PathVariable UUID id) {
-        var result = getPaymentProcessor.process(new GetPaymentProcessor.Request(id, userId));
+        var result = getPaymentProcessor.process(new GetPaymentProcessorRequest(id, userId));
         return ok("Payment retrieved successfully",
-                PaymentResponseMapper.toResponse(result.intent(), null, result.refunds()));
+                PaymentResponseMapper.toResponse(result.getIntent(), null, result.getRefunds()));
     }
 
     private static <T> ResponseEntity<Response<T>> ok(String message, T body) {

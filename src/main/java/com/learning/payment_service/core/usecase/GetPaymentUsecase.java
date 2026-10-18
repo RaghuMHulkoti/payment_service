@@ -9,13 +9,9 @@ import java.util.List;
 import java.util.UUID;
 
 /** Status lookup. With a customerId the caller must own the payment; someone else's payment looks like 404. */
-public class GetPaymentUsecase implements Usecase<GetPaymentUsecase.Request, GetPaymentUsecase.Response> {
+public class GetPaymentUsecase implements Usecase<GetPaymentUsecaseRequest, GetPaymentUsecaseResponse> {
 
-    public record Request(UUID paymentId, UUID customerId) implements UsecaseRequest {
-    }
 
-    public record Response(PaymentIntent intent, List<Refund> refunds) implements UsecaseResponse {
-    }
 
     private final PaymentGateway gateway;
 
@@ -24,10 +20,10 @@ public class GetPaymentUsecase implements Usecase<GetPaymentUsecase.Request, Get
     }
 
     @Override
-    public Response execute(Request request) {
-        var intent = gateway.findIntent(request.paymentId())
-                .filter(i -> request.customerId() == null || i.customerId().equals(request.customerId()))
-                .orElseThrow(() -> new PaymentNotFoundException(request.paymentId()));
-        return new Response(intent, gateway.findRefundsByIntent(intent.id()));
+    public GetPaymentUsecaseResponse execute(GetPaymentUsecaseRequest request) {
+        var intent = gateway.findIntent(request.getPaymentId())
+                .filter(i -> request.getCustomerId() == null || i.customerId().equals(request.getCustomerId()))
+                .orElseThrow(() -> new PaymentNotFoundException(request.getPaymentId()));
+        return new GetPaymentUsecaseResponse(intent, gateway.findRefundsByIntent(intent.id()));
     }
 }

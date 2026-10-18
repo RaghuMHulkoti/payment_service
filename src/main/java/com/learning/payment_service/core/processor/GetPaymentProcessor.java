@@ -1,19 +1,9 @@
 package com.learning.payment_service.core.processor;
 
-import com.learning.payment_service.core.domain.PaymentIntent;
-import com.learning.payment_service.core.domain.Refund;
 import com.learning.payment_service.core.usecase.GetPaymentUsecase;
+import com.learning.payment_service.core.usecase.GetPaymentUsecaseRequest;
 
-import java.util.List;
-import java.util.UUID;
-
-public class GetPaymentProcessor implements Processor<GetPaymentProcessor.Request, GetPaymentProcessor.Response> {
-
-    public record Request(UUID paymentId, UUID customerId) implements ProcessorRequest {
-    }
-
-    public record Response(PaymentIntent intent, List<Refund> refunds) implements ProcessorResponse {
-    }
+public class GetPaymentProcessor implements Processor<GetPaymentProcessorRequest, GetPaymentProcessorResponse> {
 
     private final GetPaymentUsecase usecase;
 
@@ -22,8 +12,8 @@ public class GetPaymentProcessor implements Processor<GetPaymentProcessor.Reques
     }
 
     @Override
-    public Response process(Request request) {
-        var result = usecase.execute(new GetPaymentUsecase.Request(request.paymentId(), request.customerId()));
-        return new Response(result.intent(), result.refunds());
+    public GetPaymentProcessorResponse process(GetPaymentProcessorRequest request) {
+        var result = usecase.execute(new GetPaymentUsecaseRequest(request.getPaymentId(), request.getCustomerId()));
+        return new GetPaymentProcessorResponse(result.getIntent(), result.getRefunds());
     }
 }

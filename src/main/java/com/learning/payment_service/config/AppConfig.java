@@ -1,5 +1,12 @@
 package com.learning.payment_service.config;
 
+import com.learning.payment_service.core.service.outbox.OutboxService;
+import com.learning.payment_service.core.service.intent.requiresaction.MarkIntentRequiresActionService;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentService;
+import com.learning.payment_service.core.service.intent.fail.FailIntentService;
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentService;
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundService;
+import com.learning.payment_service.core.service.refund.fail.FailRefundService;
 import com.learning.payment_service.core.processor.ConfirmIntentProcessor;
 import com.learning.payment_service.core.processor.CreateIntentProcessor;
 import com.learning.payment_service.core.processor.CreateRefundProcessor;
@@ -11,8 +18,6 @@ import com.learning.payment_service.core.provider.ProviderRegistry;
 import com.learning.payment_service.core.provider.RetryingProviderCall;
 import com.learning.payment_service.core.provider.WebhookHandler;
 import com.learning.payment_service.core.provider.WebhookHandlers;
-import com.learning.payment_service.core.service.OutboxWriter;
-import com.learning.payment_service.core.service.PaymentStateService;
 import com.learning.payment_service.core.usecase.ConfirmIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateRefundUsecase;
@@ -20,8 +25,13 @@ import com.learning.payment_service.core.usecase.GetPaymentUsecase;
 import com.learning.payment_service.core.usecase.ProcessWebhookEventsUsecase;
 import com.learning.payment_service.core.usecase.ReceiveWebhookUsecase;
 import com.learning.payment_service.core.usecase.ReconcileStuckIntentsUsecase;
-import com.learning.payment_service.gateway.JdbcPaymentGateway;
-import com.learning.payment_service.gateway.JdbcWebhookEventGateway;
+import com.learning.payment_service.gateway.JpaPaymentGateway;
+import com.learning.payment_service.gateway.JpaWebhookEventGateway;
+import com.learning.payment_service.gateway.PaymentAttemptRepository;
+import com.learning.payment_service.gateway.PaymentIntentRepository;
+import com.learning.payment_service.gateway.PaymentOutboxRepository;
+import com.learning.payment_service.gateway.RefundRepository;
+import com.learning.payment_service.gateway.WebhookEventRepository;
 import com.learning.payment_service.gateway.PaymentGateway;
 import com.learning.payment_service.gateway.ReconciliationJob;
 import com.learning.payment_service.gateway.WebhookEventGateway;
@@ -33,7 +43,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -85,24 +94,18 @@ public class AppConfig {
     // =========================================================================
 
     @Bean
-    public CreateIntentUsecase createIntentUsecase(PaymentGateway gateway, ProviderRegistry providers,
-                                                   RetryingProviderCall retry, PaymentStateService state,
-                                                   OutboxWriter outbox, Clock clock) {
-        return new CreateIntentUsecase(gateway, providers, retry, state, outbox, clock);
+    public CreateIntentUsecase createIntentUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry, FailIntentService failIntentService, MarkIntentRequiresActionService markIntentRequiresActionService, OutboxService outboxService, Clock clock) {
+        return new CreateIntentUsecase(gateway, providers, retry, failIntentService, markIntentRequiresActionService, outboxService, clock);
     }
 
     @Bean
-    public ConfirmIntentUsecase confirmIntentUsecase(PaymentGateway gateway, ProviderRegistry providers,
-                                                     RetryingProviderCall retry, PaymentStateService state,
-                                                     Clock clock) {
-        return new ConfirmIntentUsecase(gateway, providers, retry, state, clock);
+    public CreateRefundUsecase createRefundUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry, CompleteRefundService completeRefundService, FailRefundService failRefundService, OutboxService outboxService, Clock clock) {
+        return new CreateRefundUsecase(gateway, providers, retry, completeRefundService, failRefundService, outboxService, clock);
     }
 
     @Bean
-    public CreateRefundUsecase createRefundUsecase(PaymentGateway gateway, ProviderRegistry providers,
-                                                   RetryingProviderCall retry, PaymentStateService state,
-                                                   OutboxWriter outbox, Clock clock) {
-        return new CreateRefundUsecase(gateway, providers, retry, state, outbox, clock);
+    public ConfirmIntentUsecase confirmIntentUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry, CaptureIntentService captureIntentService, FailIntentService failIntentService, Clock clock) {
+        return new ConfirmIntentUsecase(gateway, providers, retry, captureIntentService, failIntentService, clock);
     }
 
     @Bean
@@ -116,16 +119,13 @@ public class AppConfig {
     }
 
     @Bean
-    public ProcessWebhookEventsUsecase processWebhookEventsUsecase(WebhookEventGateway events, PaymentGateway gateway,
-                                                                   WebhookHandlers handlers, PaymentStateService state,
-                                                                   Clock clock) {
-        return new ProcessWebhookEventsUsecase(events, gateway, handlers, state, clock);
+    public ProcessWebhookEventsUsecase processWebhookEventsUsecase(WebhookEventGateway events, PaymentGateway gateway, WebhookHandlers handlers, CancelIntentService cancelIntentService, CaptureIntentService captureIntentService, CompleteRefundService completeRefundService, FailIntentService failIntentService, FailRefundService failRefundService, Clock clock) {
+        return new ProcessWebhookEventsUsecase(events, gateway, handlers, cancelIntentService, captureIntentService, completeRefundService, failIntentService, failRefundService, clock);
     }
 
     @Bean
-    public ReconcileStuckIntentsUsecase reconcileStuckIntentsUsecase(PaymentGateway gateway, ProviderRegistry providers,
-                                                                     PaymentStateService state, Clock clock) {
-        return new ReconcileStuckIntentsUsecase(gateway, providers, state, clock);
+    public ReconcileStuckIntentsUsecase reconcileStuckIntentsUsecase(PaymentGateway gateway, ProviderRegistry providers, CancelIntentService cancelIntentService, CaptureIntentService captureIntentService, FailIntentService failIntentService, Clock clock) {
+        return new ReconcileStuckIntentsUsecase(gateway, providers, cancelIntentService, captureIntentService, failIntentService, clock);
     }
 
     // =========================================================================
@@ -133,13 +133,38 @@ public class AppConfig {
     // =========================================================================
 
     @Bean
-    public PaymentStateService paymentStateService(PaymentGateway gateway, OutboxWriter outbox, Clock clock) {
-        return new PaymentStateService(gateway, outbox, clock);
+    public OutboxService outboxService(PaymentGateway gateway, JsonMapper mapper, Clock clock) {
+        return new OutboxService(gateway, mapper, clock);
     }
 
     @Bean
-    public OutboxWriter outboxWriter(PaymentGateway gateway, JsonMapper mapper, Clock clock) {
-        return new OutboxWriter(gateway, mapper, clock);
+    public CaptureIntentService captureIntentService(PaymentGateway gateway, OutboxService outboxService, Clock clock) {
+        return new CaptureIntentService(gateway, outboxService, clock);
+    }
+
+    @Bean
+    public FailIntentService failIntentService(PaymentGateway gateway, OutboxService outboxService, Clock clock) {
+        return new FailIntentService(gateway, outboxService, clock);
+    }
+
+    @Bean
+    public CancelIntentService cancelIntentService(PaymentGateway gateway, OutboxService outboxService, Clock clock) {
+        return new CancelIntentService(gateway, outboxService, clock);
+    }
+
+    @Bean
+    public MarkIntentRequiresActionService markIntentRequiresActionService(PaymentGateway gateway, Clock clock) {
+        return new MarkIntentRequiresActionService(gateway, clock);
+    }
+
+    @Bean
+    public CompleteRefundService completeRefundService(PaymentGateway gateway, OutboxService outboxService, Clock clock) {
+        return new CompleteRefundService(gateway, outboxService, clock);
+    }
+
+    @Bean
+    public FailRefundService failRefundService(PaymentGateway gateway, Clock clock) {
+        return new FailRefundService(gateway, clock);
     }
 
     // =========================================================================
@@ -147,13 +172,15 @@ public class AppConfig {
     // =========================================================================
 
     @Bean
-    public PaymentGateway paymentGateway(JdbcTemplate jdbcTemplate, PlatformTransactionManager transactionManager) {
-        return new JdbcPaymentGateway(jdbcTemplate, new TransactionTemplate(transactionManager));
+    public PaymentGateway paymentGateway(PaymentIntentRepository intents, PaymentAttemptRepository attempts,
+                                         RefundRepository refunds, PaymentOutboxRepository outbox,
+                                         PlatformTransactionManager transactionManager) {
+        return new JpaPaymentGateway(intents, attempts, refunds, outbox, new TransactionTemplate(transactionManager));
     }
 
     @Bean
-    public WebhookEventGateway webhookEventGateway(JdbcTemplate jdbcTemplate) {
-        return new JdbcWebhookEventGateway(jdbcTemplate);
+    public WebhookEventGateway webhookEventGateway(WebhookEventRepository repository) {
+        return new JpaWebhookEventGateway(repository);
     }
 
     /**

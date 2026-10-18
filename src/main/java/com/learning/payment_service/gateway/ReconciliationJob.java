@@ -2,6 +2,7 @@ package com.learning.payment_service.gateway;
 
 import com.learning.payment_service.config.PaymentProperties;
 import com.learning.payment_service.core.usecase.ReconcileStuckIntentsUsecase;
+import com.learning.payment_service.core.usecase.ReconcileStuckIntentsUsecaseRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -24,7 +25,7 @@ public class ReconciliationJob {
     public void run() {
         try {
             int reconciled = usecase.execute(
-                    new ReconcileStuckIntentsUsecase.Request(properties.stuckAfter(), BATCH)).reconciled();
+                    new ReconcileStuckIntentsUsecaseRequest(properties.stuckAfter(), BATCH)).getReconciled();
             if (reconciled > 0) {
                 log.info("Reconciled {} stuck payment(s)", reconciled);
             }

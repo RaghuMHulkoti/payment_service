@@ -1,7 +1,12 @@
 package com.learning.payment_service.core.usecase;
 
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentService;
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentServiceRequest;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentService;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentServiceRequest;
+import com.learning.payment_service.core.service.intent.fail.FailIntentService;
+import com.learning.payment_service.core.service.intent.fail.FailIntentServiceRequest;
 import com.learning.payment_service.core.provider.ProviderRegistry;
-import com.learning.payment_service.core.service.PaymentStateService;
 import com.learning.payment_service.gateway.PaymentGateway;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,38 +21,36 @@ import java.time.ZoneOffset;
  * the PSP's canonical status. An intent that never got a provider id is failed (the PSP never heard of it).
  */
 public class ReconcileStuckIntentsUsecase
-        implements Usecase<ReconcileStuckIntentsUsecase.Request, ReconcileStuckIntentsUsecase.Response> {
+        implements Usecase<ReconcileStuckIntentsUsecaseRequest, ReconcileStuckIntentsUsecaseResponse> {
 
     private static final Logger log = LoggerFactory.getLogger(ReconcileStuckIntentsUsecase.class);
 
-    public record Request(Duration stuckAfter, int limit) implements UsecaseRequest {
-    }
 
-    public record Response(int reconciled) implements UsecaseResponse {
-    }
 
     private final PaymentGateway gateway;
     private final ProviderRegistry providers;
-    private final PaymentStateService state;
+    private final CancelIntentService cancelIntentService;
+    private final CaptureIntentService captureIntentService;
+    private final FailIntentService failIntentService;
     private final Clock clock;
 
-    public ReconcileStuckIntentsUsecase(PaymentGateway gateway, ProviderRegistry providers,
-                                        PaymentStateService state, Clock clock) {
+    public ReconcileStuckIntentsUsecase(PaymentGateway gateway, ProviderRegistry providers, CancelIntentService cancelIntentService, CaptureIntentService captureIntentService, FailIntentService failIntentService, Clock clock) {
         this.gateway = gateway;
         this.providers = providers;
-        this.state = state;
+        this.cancelIntentService = cancelIntentService;
+        this.captureIntentService = captureIntentService;
+        this.failIntentService = failIntentService;
         this.clock = clock;
     }
 
     @Override
-    public Response execute(Request request) {
-        var cutoff = OffsetDateTime.now(clock).withOffsetSameInstant(ZoneOffset.UTC).minus(request.stuckAfter());
+    public ReconcileStuckIntentsUsecaseResponse execute(ReconcileStuckIntentsUsecaseRequest request) {
+        var cutoff = OffsetDateTime.now(clock).withOffsetSameInstant(ZoneOffset.UTC).minus(request.getStuckAfter());
         int reconciled = 0;
-        for (var intent : gateway.findStuckIntents(cutoff, request.limit())) {
+        for (var intent : gateway.findStuckIntents(cutoff, request.getLimit())) {
             try {
                 if (intent.providerIntentId() == null) {
-                    state.markFailed(intent, "INTENT_CREATION_TIMEOUT",
-                            "The payment provider never confirmed this intent");
+                    failIntentService.execute(FailIntentServiceRequest.builder().intent(intent).code("INTENT_CREATION_TIMEOUT").message("The payment provider never confirmed this intent").build());
                     reconciled++;
                     continue;
                 }
@@ -56,10 +59,9 @@ public class ReconcileStuckIntentsUsecase
                     continue;
                 }
                 switch (status.get()) {
-                    case SUCCEEDED -> state.markCaptured(intent);
-                    case FAILED -> state.markFailed(intent, "PROVIDER_REPORTED_FAILURE",
-                            "The payment provider reports this payment failed");
-                    case CANCELLED -> state.markCancelled(intent);
+                    case SUCCEEDED -> captureIntentService.execute(CaptureIntentServiceRequest.builder().intent(intent).build()).getIntent();
+                    case FAILED -> failIntentService.execute(FailIntentServiceRequest.builder().intent(intent).code("PROVIDER_REPORTED_FAILURE").message("The payment provider reports this payment failed").build()).getIntent();
+                    case CANCELLED -> cancelIntentService.execute(CancelIntentServiceRequest.builder().intent(intent).build()).getIntent();
                     case PENDING -> {
                         continue;
                     }
@@ -69,6 +71,6 @@ public class ReconcileStuckIntentsUsecase
                 log.warn("Reconciling payment {} failed: {}", intent.id(), e.getMessage());
             }
         }
-        return new Response(reconciled);
+        return new ReconcileStuckIntentsUsecaseResponse(reconciled);
     }
 }

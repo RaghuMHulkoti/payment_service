@@ -2,6 +2,7 @@ package com.learning.payment_service.web;
 
 import com.learning.payment_service.core.domain.Provider;
 import com.learning.payment_service.core.processor.ReceiveWebhookProcessor;
+import com.learning.payment_service.core.processor.ReceiveWebhookProcessorRequest;
 import com.learning.payment_service.core.provider.WebhookHandler.WebhookRequest;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -44,7 +45,7 @@ public class WebhookController {
     }
 
     private ResponseEntity<Void> receive(Provider provider, HttpHeaders headers, byte[] body) {
-        processor.process(new ReceiveWebhookProcessor.Request(provider,
+        processor.process(new ReceiveWebhookProcessorRequest(provider,
                 new WebhookRequest(new String(body, StandardCharsets.UTF_8), headers::getFirst)));
         return ResponseEntity.ok().build();
     }

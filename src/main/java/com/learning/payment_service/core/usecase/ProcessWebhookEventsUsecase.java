@@ -1,12 +1,21 @@
 package com.learning.payment_service.core.usecase;
 
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentService;
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentServiceRequest;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentService;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentServiceRequest;
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundService;
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundServiceRequest;
+import com.learning.payment_service.core.service.intent.fail.FailIntentService;
+import com.learning.payment_service.core.service.intent.fail.FailIntentServiceRequest;
+import com.learning.payment_service.core.service.refund.fail.FailRefundService;
+import com.learning.payment_service.core.service.refund.fail.FailRefundServiceRequest;
 import com.learning.payment_service.core.domain.PaymentIntent;
 import com.learning.payment_service.core.domain.RefundStatus;
 import com.learning.payment_service.core.domain.WebhookEvent;
 import com.learning.payment_service.core.provider.WebhookHandler;
 import com.learning.payment_service.core.provider.WebhookHandler.NormalizedWebhook;
 import com.learning.payment_service.core.provider.WebhookHandlers;
-import com.learning.payment_service.core.service.PaymentStateService;
 import com.learning.payment_service.exception.ConflictException;
 import com.learning.payment_service.gateway.PaymentGateway;
 import com.learning.payment_service.gateway.WebhookEventGateway;
@@ -24,36 +33,39 @@ import java.time.ZoneOffset;
  * {@code UNKNOWN_GRACE}. A concurrent change (optimistic conflict) is also just retried next run.
  */
 public class ProcessWebhookEventsUsecase
-        implements Usecase<ProcessWebhookEventsUsecase.Request, ProcessWebhookEventsUsecase.Response> {
+        implements Usecase<ProcessWebhookEventsUsecaseRequest, ProcessWebhookEventsUsecaseResponse> {
 
     private static final Logger log = LoggerFactory.getLogger(ProcessWebhookEventsUsecase.class);
     static final Duration UNKNOWN_GRACE = Duration.ofHours(1);
 
-    public record Request(int limit) implements UsecaseRequest {
-    }
 
-    public record Response(int processed) implements UsecaseResponse {
-    }
 
     private final WebhookEventGateway events;
     private final PaymentGateway gateway;
     private final WebhookHandlers handlers;
-    private final PaymentStateService state;
+    private final CancelIntentService cancelIntentService;
+    private final CaptureIntentService captureIntentService;
+    private final CompleteRefundService completeRefundService;
+    private final FailIntentService failIntentService;
+    private final FailRefundService failRefundService;
     private final Clock clock;
 
-    public ProcessWebhookEventsUsecase(WebhookEventGateway events, PaymentGateway gateway, WebhookHandlers handlers,
-                                       PaymentStateService state, Clock clock) {
+    public ProcessWebhookEventsUsecase(WebhookEventGateway events, PaymentGateway gateway, WebhookHandlers handlers, CancelIntentService cancelIntentService, CaptureIntentService captureIntentService, CompleteRefundService completeRefundService, FailIntentService failIntentService, FailRefundService failRefundService, Clock clock) {
         this.events = events;
         this.gateway = gateway;
         this.handlers = handlers;
-        this.state = state;
+        this.cancelIntentService = cancelIntentService;
+        this.captureIntentService = captureIntentService;
+        this.completeRefundService = completeRefundService;
+        this.failIntentService = failIntentService;
+        this.failRefundService = failRefundService;
         this.clock = clock;
     }
 
     @Override
-    public Response execute(Request request) {
+    public ProcessWebhookEventsUsecaseResponse execute(ProcessWebhookEventsUsecaseRequest request) {
         int processed = 0;
-        for (var event : events.findUnprocessed(request.limit())) {
+        for (var event : events.findUnprocessed(request.getLimit())) {
             try {
                 if (apply(event)) {
                     events.markProcessed(event.id(), now());
@@ -65,7 +77,7 @@ public class ProcessWebhookEventsUsecase
                 log.warn("Webhook {} {} failed: {}", event.provider(), event.providerEventId(), e.getMessage());
             }
         }
-        return new Response(processed);
+        return new ProcessWebhookEventsUsecaseResponse(processed);
     }
 
     /** Returns true when the event is finished (applied, ignored or abandoned), false to retry it later. */
@@ -78,7 +90,7 @@ public class ProcessWebhookEventsUsecase
                     return isStale(event);
                 }
                 if (intent.status().isOpen()) {
-                    state.markCaptured(intent);
+                    captureIntentService.execute(CaptureIntentServiceRequest.builder().intent(intent).build());
                 }
             }
             case PAYMENT_FAILED -> {
@@ -87,7 +99,7 @@ public class ProcessWebhookEventsUsecase
                     return isStale(event);
                 }
                 if (intent.status().isOpen()) {
-                    state.markFailed(intent, n.failureCode(), n.failureMessage());
+                    failIntentService.execute(FailIntentServiceRequest.builder().intent(intent).code(n.failureCode()).message(n.failureMessage()).build());
                 }
             }
             case PAYMENT_CANCELLED -> {
@@ -96,7 +108,7 @@ public class ProcessWebhookEventsUsecase
                     return isStale(event);
                 }
                 if (intent.status().isOpen()) {
-                    state.markCancelled(intent);
+                    cancelIntentService.execute(CancelIntentServiceRequest.builder().intent(intent).build());
                 }
             }
             case REFUND_SUCCEEDED, REFUND_FAILED -> {
@@ -107,9 +119,9 @@ public class ProcessWebhookEventsUsecase
                 }
                 if (refund.status() == RefundStatus.INITIATED || refund.status() == RefundStatus.PROCESSING) {
                     if (n.kind() == WebhookHandler.EventKind.REFUND_SUCCEEDED) {
-                        state.completeRefund(refund, n.providerRefundId());
+                        completeRefundService.execute(CompleteRefundServiceRequest.builder().refund(refund).providerRefundId(n.providerRefundId()).build());
                     } else {
-                        state.failRefund(refund);
+                        failRefundService.execute(FailRefundServiceRequest.builder().refund(refund).build());
                     }
                 }
             }

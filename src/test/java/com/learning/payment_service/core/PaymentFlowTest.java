@@ -8,8 +8,14 @@ import com.learning.payment_service.core.provider.ProviderRegistry;
 import com.learning.payment_service.core.provider.RetryingProviderCall;
 import com.learning.payment_service.core.provider.WebhookHandler.WebhookRequest;
 import com.learning.payment_service.core.provider.WebhookHandlers;
-import com.learning.payment_service.core.service.OutboxWriter;
-import com.learning.payment_service.core.service.PaymentStateService;
+import com.learning.payment_service.core.service.intent.cancel.CancelIntentService;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentService;
+import com.learning.payment_service.core.service.intent.fail.FailIntentService;
+import com.learning.payment_service.core.service.intent.requiresaction.MarkIntentRequiresActionService;
+import com.learning.payment_service.core.service.outbox.OutboxService;
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundService;
+import com.learning.payment_service.core.service.refund.fail.FailRefundService;
+import com.learning.payment_service.core.usecase.*;
 import com.learning.payment_service.core.usecase.ConfirmIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateRefundUsecase;
@@ -21,19 +27,16 @@ import com.learning.payment_service.exception.BusinessRuleViolationException;
 import com.learning.payment_service.exception.DependencyUnavailableException;
 import com.learning.payment_service.exception.InvalidWebhookException;
 import com.learning.payment_service.exception.PaymentNotFoundException;
-import com.learning.payment_service.gateway.JdbcPaymentGateway;
-import com.learning.payment_service.gateway.JdbcWebhookEventGateway;
+import com.learning.payment_service.gateway.PaymentGateway;
+import com.learning.payment_service.gateway.WebhookEventGateway;
 import com.learning.payment_service.gateway.provider.SimulatedPaymentProvider;
 import com.learning.payment_service.gateway.webhook.RazorpayWebhookHandler;
 import com.learning.payment_service.gateway.webhook.StripeWebhookHandler;
 import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.junit.jupiter.api.Test;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
-import org.springframework.jdbc.datasource.SingleConnectionDataSource;
-import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
-import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.json.JsonMapper;
 
 import javax.crypto.Mac;
@@ -52,9 +55,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The whole payment flow through the real use cases, gateway SQL and V1 migration on H2 (Oracle mode), with the
- * simulated PSP. It catches schema, SQL and state-machine mistakes; it does not replace a run against Oracle.
+ * The whole payment flow through the real use cases, JPA gateways and V1 migration on H2 (Oracle mode), with the
+ * simulated PSP. It catches schema, mapping and state-machine mistakes; it does not replace a run against Oracle.
  */
+@SpringBootTest(properties = {
+        "spring.datasource.url=jdbc:h2:mem:paymentflow;MODE=Oracle",
+        "spring.datasource.username=sa",
+        "spring.datasource.password=",
+        "spring.datasource.driver-class-name=org.h2.Driver",
+        "spring.datasource.hikari.connection-test-query=SELECT 1",
+        "spring.datasource.hikari.connection-init-sql=SELECT 1",
+        "spring.flyway.enabled=false",
+        "spring.sql.init.mode=always",
+        "spring.sql.init.schema-locations=classpath:db/migration/V1__create_payment_schema.sql",
+        "payment.jobs.enabled=false"
+})
 class PaymentFlowTest {
 
     static final String STRIPE_SECRET = "whsec_test";
@@ -63,9 +78,12 @@ class PaymentFlowTest {
     final UUID order = UUID.randomUUID();
     final UUID customer = UUID.randomUUID();
 
+    @Autowired
     JdbcTemplate jdbc;
-    JdbcPaymentGateway gateway;
-    JdbcWebhookEventGateway events;
+    @Autowired
+    PaymentGateway gateway;
+    @Autowired
+    WebhookEventGateway events;
     SimulatedPaymentProvider stripe;
     SimulatedPaymentProvider razorpay;
     MutableClock clock;
@@ -79,32 +97,34 @@ class PaymentFlowTest {
 
     @BeforeEach
     void setUp() {
-        // One shared connection: H2 caches IN (...) check lists against the session that created them, so the
-        // session that ran the migration must stay open (DriverManagerDataSource would close it).
-        var ds = new SingleConnectionDataSource("jdbc:h2:mem:" + UUID.randomUUID() + ";MODE=Oracle;DB_CLOSE_DELAY=-1", "sa", "", true);
-        new ResourceDatabasePopulator(new ClassPathResource("db/migration/V1__create_payment_schema.sql")).execute(ds);
-        jdbc = new JdbcTemplate(ds);
-        gateway = new JdbcPaymentGateway(jdbc, new TransactionTemplate(new DataSourceTransactionManager(ds)));
-        events = new JdbcWebhookEventGateway(jdbc);
+        // the Spring context (and its H2 database) is shared by every test, so start each one empty
+        for (var table : List.of("payment_outbox", "webhook_events", "refunds", "payment_attempts", "payment_intents")) {
+            jdbc.update("DELETE FROM " + table);
+        }
         clock = new MutableClock(Instant.parse("2026-10-18T10:00:00Z"));
         stripe = new SimulatedPaymentProvider(Provider.STRIPE);
         razorpay = new SimulatedPaymentProvider(Provider.RAZORPAY);
 
         var providers = new ProviderRegistry(List.<PaymentProvider>of(stripe, razorpay));
         var retry = new RetryingProviderCall(3, Duration.ZERO);
-        var outbox = new OutboxWriter(gateway, JsonMapper.builder().build(), clock);
-        var state = new PaymentStateService(gateway, outbox, clock);
+        var outbox = new OutboxService(gateway, JsonMapper.builder().build(), clock);
+        var capture = new CaptureIntentService(gateway, outbox, clock);
+        var fail = new FailIntentService(gateway, outbox, clock);
+        var cancel = new CancelIntentService(gateway, outbox, clock);
+        var requiresAction = new MarkIntentRequiresActionService(gateway, clock);
+        var completeRefund = new CompleteRefundService(gateway, outbox, clock);
+        var failRefund = new FailRefundService(gateway, clock);
         var handlers = new WebhookHandlers(List.of(
                 new StripeWebhookHandler(STRIPE_SECRET, Duration.ofMinutes(5), clock),
                 new RazorpayWebhookHandler(RAZORPAY_SECRET)));
 
-        createIntent = new CreateIntentUsecase(gateway, providers, retry, state, outbox, clock);
-        confirm = new ConfirmIntentUsecase(gateway, providers, retry, state, clock);
-        refund = new CreateRefundUsecase(gateway, providers, retry, state, outbox, clock);
+        createIntent = new CreateIntentUsecase(gateway, providers, retry, fail, requiresAction, outbox, clock);
+        confirm = new ConfirmIntentUsecase(gateway, providers, retry, capture, fail, clock);
+        refund = new CreateRefundUsecase(gateway, providers, retry, completeRefund, failRefund, outbox, clock);
         get = new GetPaymentUsecase(gateway);
         receive = new ReceiveWebhookUsecase(handlers, events, clock);
-        process = new ProcessWebhookEventsUsecase(events, gateway, handlers, state, clock);
-        reconcile = new ReconcileStuckIntentsUsecase(gateway, providers, state, clock);
+        process = new ProcessWebhookEventsUsecase(events, gateway, handlers, cancel, capture, completeRefund, fail, failRefund, clock);
+        reconcile = new ReconcileStuckIntentsUsecase(gateway, providers, cancel, capture, fail, clock);
     }
 
     // ---------------------------------------------------------------- create intent
@@ -113,17 +133,17 @@ class PaymentFlowTest {
     void createReturnsRequiresActionWithClientSecretAndEmitsInitiated() {
         var result = create("key-1", "1299.00", "INR");
 
-        assertThat(result.created()).isTrue();
-        assertThat(result.intent().status()).isEqualTo(PaymentStatus.REQUIRES_ACTION);
-        assertThat(result.intent().provider()).isEqualTo(Provider.RAZORPAY); // INR routes to Razorpay
-        assertThat(result.intent().providerIntentId()).startsWith("order_sim_");
-        assertThat(result.clientSecret()).endsWith("_secret_sim");
+        assertThat(result.isCreated()).isTrue();
+        assertThat(result.getIntent().status()).isEqualTo(PaymentStatus.REQUIRES_ACTION);
+        assertThat(result.getIntent().provider()).isEqualTo(Provider.RAZORPAY); // INR routes to Razorpay
+        assertThat(result.getIntent().providerIntentId()).startsWith("order_sim_");
+        assertThat(result.getClientSecret()).endsWith("_secret_sim");
         assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED");
     }
 
     @Test
     void nonInrRoutesToStripe() {
-        assertThat(create("key-usd", "10.00", "USD").intent().provider()).isEqualTo(Provider.STRIPE);
+        assertThat(create("key-usd", "10.00", "USD").getIntent().provider()).isEqualTo(Provider.STRIPE);
     }
 
     @Test
@@ -131,9 +151,9 @@ class PaymentFlowTest {
         var first = create("key-1", "1299.00", "INR");
         var replay = create("key-1", "1299.00", "INR");
 
-        assertThat(replay.created()).isFalse();
-        assertThat(replay.intent().id()).isEqualTo(first.intent().id());
-        assertThat(replay.clientSecret()).isEqualTo(first.clientSecret());
+        assertThat(replay.isCreated()).isFalse();
+        assertThat(replay.getIntent().id()).isEqualTo(first.getIntent().id());
+        assertThat(replay.getClientSecret()).isEqualTo(first.getClientSecret());
         assertThat(count("payment_intents")).isEqualTo(1);
         assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED");
     }
@@ -160,7 +180,7 @@ class PaymentFlowTest {
     @Test
     void anOrderThatIsAlreadyPaidCannotGetAnotherIntent() {
         var paid = create("key-1", "100.00", "INR");
-        confirm(paid.intent().id(), "tok_ok");
+        confirm(paid.getIntent().id(), "tok_ok");
 
         assertThatThrownBy(() -> create("key-2", "100.00", "INR"))
                 .isInstanceOfSatisfying(BusinessRuleViolationException.class,
@@ -171,7 +191,7 @@ class PaymentFlowTest {
 
     @Test
     void successfulConfirmCapturesAndEmitsPaymentSuccess() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
 
         var confirmed = confirm(intent.id(), "tok_ok");
 
@@ -183,7 +203,7 @@ class PaymentFlowTest {
 
     @Test
     void confirmingACapturedPaymentAgainIsANoOp() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
         confirm(intent.id(), "tok_ok");
 
         var again = confirm(intent.id(), "tok_ok");
@@ -195,7 +215,7 @@ class PaymentFlowTest {
 
     @Test
     void declinedCardFailsTheIntentAndEmitsPaymentFailed() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
 
         var confirmed = confirm(intent.id(), "tok_fail_card");
 
@@ -209,7 +229,7 @@ class PaymentFlowTest {
 
     @Test
     void threeDSecureLeavesTheIntentWaitingForTheCustomer() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
 
         assertThat(confirm(intent.id(), "tok_3ds").status()).isEqualTo(PaymentStatus.REQUIRES_ACTION);
         assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED");
@@ -219,12 +239,12 @@ class PaymentFlowTest {
 
     @Test
     void providerOutageIsA503AndLeavesTheIntentUntouched() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
 
         assertThatThrownBy(() -> confirm(intent.id(), "tok_transient"))
                 .isInstanceOf(DependencyUnavailableException.class);
 
-        assertThat(get.execute(new GetPaymentUsecase.Request(intent.id(), null)).intent().status())
+        assertThat(get.execute(new GetPaymentUsecaseRequest(intent.id(), null)).getIntent().status())
                 .isEqualTo(PaymentStatus.REQUIRES_ACTION);
         assertThat(jdbc.queryForObject("SELECT status FROM payment_attempts", String.class)).isEqualTo("ERROR");
     }
@@ -238,10 +258,10 @@ class PaymentFlowTest {
 
     @Test
     void anotherCustomerCannotReadAPayment() {
-        var intent = create("key-1", "250.00", "INR").intent();
+        var intent = create("key-1", "250.00", "INR").getIntent();
 
-        assertThat(get.execute(new GetPaymentUsecase.Request(intent.id(), customer)).intent().id()).isEqualTo(intent.id());
-        assertThatThrownBy(() -> get.execute(new GetPaymentUsecase.Request(intent.id(), UUID.randomUUID())))
+        assertThat(get.execute(new GetPaymentUsecaseRequest(intent.id(), customer)).getIntent().id()).isEqualTo(intent.id());
+        assertThatThrownBy(() -> get.execute(new GetPaymentUsecaseRequest(intent.id(), UUID.randomUUID())))
                 .isInstanceOf(PaymentNotFoundException.class);
     }
 
@@ -252,13 +272,13 @@ class PaymentFlowTest {
         capture("key-1", "100.00");
 
         var first = refund("refund_1", "30.00");
-        assertThat(first.created()).isTrue();
-        assertThat(first.refund().status()).isEqualTo(RefundStatus.SUCCESS);
-        assertThat(first.intent().status()).isEqualTo(PaymentStatus.PARTIALLY_REFUNDED);
+        assertThat(first.isCreated()).isTrue();
+        assertThat(first.getRefund().status()).isEqualTo(RefundStatus.SUCCESS);
+        assertThat(first.getIntent().status()).isEqualTo(PaymentStatus.PARTIALLY_REFUNDED);
 
         var rest = refund("refund_2", null); // omitted amount = whatever is left
-        assertThat(rest.refund().amount()).isEqualByComparingTo("70.00");
-        assertThat(rest.intent().status()).isEqualTo(PaymentStatus.REFUNDED);
+        assertThat(rest.getRefund().amount()).isEqualByComparingTo("70.00");
+        assertThat(rest.getIntent().status()).isEqualTo(PaymentStatus.REFUNDED);
         assertThat(outboxTypes()).containsSubsequence("PAYMENT_SUCCESS", "REFUND_INITIATED", "REFUND_COMPLETED",
                 "REFUND_INITIATED", "REFUND_COMPLETED");
     }
@@ -291,8 +311,8 @@ class PaymentFlowTest {
 
         var replay = refund("refund_1", "40.00");
 
-        assertThat(replay.created()).isFalse();
-        assertThat(replay.refund().id()).isEqualTo(first.refund().id());
+        assertThat(replay.isCreated()).isFalse();
+        assertThat(replay.getRefund().id()).isEqualTo(first.getRefund().id());
         assertThat(count("refunds")).isEqualTo(1);
         assertThatThrownBy(() -> refund("refund_1", "50.00"))
                 .isInstanceOfSatisfying(BusinessRuleViolationException.class,
@@ -312,39 +332,39 @@ class PaymentFlowTest {
 
     @Test
     void webhookIsVerifiedStoredOnceAndThenAppliedByTheProcessor() {
-        var intent = create("key-1", "100.00", "USD").intent(); // Stripe
+        var intent = create("key-1", "100.00", "USD").getIntent(); // Stripe
         String body = stripeEvent("evt_1", "payment_intent.succeeded", intent.providerIntentId());
 
-        assertThat(receive.execute(stripeRequest(body)).duplicate()).isFalse();
-        assertThat(receive.execute(stripeRequest(body)).duplicate()).isTrue(); // PSP retry
+        assertThat(receive.execute(stripeRequest(body)).isDuplicate()).isFalse();
+        assertThat(receive.execute(stripeRequest(body)).isDuplicate()).isTrue(); // PSP retry
         assertThat(count("webhook_events")).isEqualTo(1);
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION); // stored, not applied yet
 
-        assertThat(process.execute(new ProcessWebhookEventsUsecase.Request(10)).processed()).isEqualTo(1);
+        assertThat(process.execute(new ProcessWebhookEventsUsecaseRequest(10)).getProcessed()).isEqualTo(1);
 
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.CAPTURED);
         assertThat(outboxTypes()).contains("PAYMENT_SUCCESS");
-        assertThat(process.execute(new ProcessWebhookEventsUsecase.Request(10)).processed()).isZero();
+        assertThat(process.execute(new ProcessWebhookEventsUsecaseRequest(10)).getProcessed()).isZero();
     }
 
     @Test
     void webhookWithABadSignatureIsRejectedAndNotStored() {
-        var intent = create("key-1", "100.00", "USD").intent();
+        var intent = create("key-1", "100.00", "USD").getIntent();
         String body = stripeEvent("evt_1", "payment_intent.succeeded", intent.providerIntentId());
         var forged = new WebhookRequest(body, h -> "Stripe-Signature".equalsIgnoreCase(h) ? "t=1,v1=deadbeef" : null);
 
-        assertThatThrownBy(() -> receive.execute(new ReceiveWebhookUsecase.Request(Provider.STRIPE, forged)))
+        assertThatThrownBy(() -> receive.execute(new ReceiveWebhookUsecaseRequest(Provider.STRIPE, forged)))
                 .isInstanceOfSatisfying(InvalidWebhookException.class, e -> assertThat(e.isBadSignature()).isTrue());
         assertThat(count("webhook_events")).isZero();
     }
 
     @Test
     void failedWebhookFailsTheIntentAndSucceededAfterwardsDoesNotResurrectIt() {
-        var intent = create("key-1", "100.00", "USD").intent();
+        var intent = create("key-1", "100.00", "USD").getIntent();
         receive.execute(stripeRequest(stripeEvent("evt_1", "payment_intent.payment_failed", intent.providerIntentId())));
         receive.execute(stripeRequest(stripeEvent("evt_2", "payment_intent.succeeded", intent.providerIntentId())));
 
-        process.execute(new ProcessWebhookEventsUsecase.Request(10));
+        process.execute(new ProcessWebhookEventsUsecaseRequest(10));
 
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.FAILED);
         assertThat(outboxTypes()).doesNotContain("PAYMENT_SUCCESS");
@@ -352,16 +372,16 @@ class PaymentFlowTest {
 
     @Test
     void razorpayWebhookCapturesTheIntentByOrderId() {
-        var intent = create("key-1", "100.00", "INR").intent(); // Razorpay
+        var intent = create("key-1", "100.00", "INR").getIntent(); // Razorpay
         String body = "{\"event\":\"payment.captured\",\"payload\":{\"payment\":{\"entity\":{\"id\":\"pay_1\",\"order_id\":\""
                 + intent.providerIntentId() + "\"}}}}";
 
-        receive.execute(new ReceiveWebhookUsecase.Request(Provider.RAZORPAY, new WebhookRequest(body, h -> switch (h.toLowerCase()) {
+        receive.execute(new ReceiveWebhookUsecaseRequest(Provider.RAZORPAY, new WebhookRequest(body, h -> switch (h.toLowerCase()) {
             case "x-razorpay-signature" -> hmac(RAZORPAY_SECRET, body);
             case "x-razorpay-event-id" -> "evt_rzp_1";
             default -> null;
         })));
-        process.execute(new ProcessWebhookEventsUsecase.Request(10));
+        process.execute(new ProcessWebhookEventsUsecaseRequest(10));
 
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.CAPTURED);
     }
@@ -370,10 +390,10 @@ class PaymentFlowTest {
     void webhookForAnUnknownIntentIsRetriedThenDroppedAfterTheGracePeriod() {
         receive.execute(stripeRequest(stripeEvent("evt_x", "payment_intent.succeeded", "pi_unknown")));
 
-        assertThat(process.execute(new ProcessWebhookEventsUsecase.Request(10)).processed()).isZero(); // left for later
+        assertThat(process.execute(new ProcessWebhookEventsUsecaseRequest(10)).getProcessed()).isZero(); // left for later
 
         clock.advance(Duration.ofHours(2));
-        assertThat(process.execute(new ProcessWebhookEventsUsecase.Request(10)).processed()).isEqualTo(1); // given up
+        assertThat(process.execute(new ProcessWebhookEventsUsecaseRequest(10)).getProcessed()).isEqualTo(1); // given up
     }
 
     @Test
@@ -384,12 +404,12 @@ class PaymentFlowTest {
                 .initiated(intent, new BigDecimal("100.00"), "test", "refund_w", clock.offsetNow()).processing("re_1"));
         String body = "{\"event\":\"refund.processed\",\"payload\":{\"refund\":{\"entity\":{\"id\":\"re_1\"}}}}";
 
-        receive.execute(new ReceiveWebhookUsecase.Request(Provider.RAZORPAY, new WebhookRequest(body, h -> switch (h.toLowerCase()) {
+        receive.execute(new ReceiveWebhookUsecaseRequest(Provider.RAZORPAY, new WebhookRequest(body, h -> switch (h.toLowerCase()) {
             case "x-razorpay-signature" -> hmac(RAZORPAY_SECRET, body);
             case "x-razorpay-event-id" -> "evt_rzp_refund";
             default -> null;
         })));
-        process.execute(new ProcessWebhookEventsUsecase.Request(10));
+        process.execute(new ProcessWebhookEventsUsecaseRequest(10));
 
         assertThat(gateway.findRefund(processing.id()).orElseThrow().status()).isEqualTo(RefundStatus.SUCCESS);
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.REFUNDED);
@@ -400,13 +420,13 @@ class PaymentFlowTest {
 
     @Test
     void reconciliationCapturesAnIntentThePspAlreadyCompleted() {
-        var intent = create("key-1", "100.00", "USD").intent();
+        var intent = create("key-1", "100.00", "USD").getIntent();
         stripe.confirm(new PaymentProvider.ConfirmCommand(intent.providerIntentId(), "tok_ok", "x")); // PSP paid, webhook lost
 
-        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecase.Request(Duration.ofHours(1), 10)).reconciled())
+        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecaseRequest(Duration.ofHours(1), 10)).getReconciled())
                 .isZero(); // not stuck yet
         clock.advance(Duration.ofHours(2));
-        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecase.Request(Duration.ofHours(1), 10)).reconciled())
+        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecaseRequest(Duration.ofHours(1), 10)).getReconciled())
                 .isEqualTo(1);
 
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.CAPTURED);
@@ -415,33 +435,33 @@ class PaymentFlowTest {
 
     @Test
     void reconciliationLeavesAPendingIntentAlone() {
-        var intent = create("key-1", "100.00", "USD").intent();
+        var intent = create("key-1", "100.00", "USD").getIntent();
         clock.advance(Duration.ofHours(2));
 
-        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecase.Request(Duration.ofHours(1), 10)).reconciled()).isZero();
+        assertThat(reconcile.execute(new ReconcileStuckIntentsUsecaseRequest(Duration.ofHours(1), 10)).getReconciled()).isZero();
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION);
     }
 
     // ---------------------------------------------------------------- helpers
 
-    CreateIntentUsecase.Response create(String key, String amount, String currency) {
-        return createIntent.execute(new CreateIntentUsecase.Request(key, order, customer, new BigDecimal(amount), currency, null));
+    CreateIntentUsecaseResponse create(String key, String amount, String currency) {
+        return createIntent.execute(new CreateIntentUsecaseRequest(key, order, customer, new BigDecimal(amount), currency, null));
     }
 
     com.learning.payment_service.core.domain.PaymentIntent confirm(UUID id, String token) {
-        return confirm.execute(new ConfirmIntentUsecase.Request(id, token)).intent();
+        return confirm.execute(new ConfirmIntentUsecaseRequest(id, token)).getIntent();
     }
 
     void capture(String key, String amount) {
-        confirm(create(key, amount, "INR").intent().id(), "tok_ok");
+        confirm(create(key, amount, "INR").getIntent().id(), "tok_ok");
     }
 
-    CreateRefundUsecase.Response refund(String key, String amount) {
-        return refund.execute(new CreateRefundUsecase.Request(key, order, amount == null ? null : new BigDecimal(amount), "test"));
+    CreateRefundUsecaseResponse refund(String key, String amount) {
+        return refund.execute(new CreateRefundUsecaseRequest(key, order, amount == null ? null : new BigDecimal(amount), "test"));
     }
 
     PaymentStatus status(UUID id) {
-        return get.execute(new GetPaymentUsecase.Request(id, null)).intent().status();
+        return get.execute(new GetPaymentUsecaseRequest(id, null)).getIntent().status();
     }
 
     int count(String table) {
@@ -461,10 +481,10 @@ class PaymentFlowTest {
                 + "\",\"last_payment_error\":{\"code\":\"card_declined\",\"message\":\"declined\"}}}}";
     }
 
-    ReceiveWebhookUsecase.Request stripeRequest(String body) {
+    ReceiveWebhookUsecaseRequest stripeRequest(String body) {
         long t = clock.instant().getEpochSecond();
         String signature = "t=" + t + ",v1=" + hmac(STRIPE_SECRET, t + "." + body);
-        return new ReceiveWebhookUsecase.Request(Provider.STRIPE,
+        return new ReceiveWebhookUsecaseRequest(Provider.STRIPE,
                 new WebhookRequest(body, h -> "Stripe-Signature".equalsIgnoreCase(h) ? signature : null));
     }
 

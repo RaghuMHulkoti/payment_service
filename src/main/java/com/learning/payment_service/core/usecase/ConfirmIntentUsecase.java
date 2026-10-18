@@ -1,5 +1,9 @@
 package com.learning.payment_service.core.usecase;
 
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentService;
+import com.learning.payment_service.core.service.intent.capture.CaptureIntentServiceRequest;
+import com.learning.payment_service.core.service.intent.fail.FailIntentService;
+import com.learning.payment_service.core.service.intent.fail.FailIntentServiceRequest;
 import com.learning.payment_service.core.domain.PaymentAttempt;
 import com.learning.payment_service.core.domain.PaymentIntent;
 import com.learning.payment_service.core.domain.PaymentStatus;
@@ -10,7 +14,6 @@ import com.learning.payment_service.core.provider.ProviderRegistry;
 import com.learning.payment_service.core.provider.ProviderRejectedException;
 import com.learning.payment_service.core.provider.ProviderTransientException;
 import com.learning.payment_service.core.provider.RetryingProviderCall;
-import com.learning.payment_service.core.service.PaymentStateService;
 import com.learning.payment_service.exception.BusinessRuleViolationException;
 import com.learning.payment_service.exception.DependencyUnavailableException;
 import com.learning.payment_service.exception.PaymentNotFoundException;
@@ -26,35 +29,32 @@ import java.util.UUID;
  * outcome, so it returns the FAILED intent (and emits PAYMENT_FAILED for the saga); only an unreachable provider
  * is an error, and it leaves the intent untouched so the caller can retry.
  */
-public class ConfirmIntentUsecase implements Usecase<ConfirmIntentUsecase.Request, ConfirmIntentUsecase.Response> {
+public class ConfirmIntentUsecase implements Usecase<ConfirmIntentUsecaseRequest, ConfirmIntentUsecaseResponse> {
 
-    public record Request(UUID intentId, String paymentMethodToken) implements UsecaseRequest {
-    }
 
-    public record Response(PaymentIntent intent) implements UsecaseResponse {
-    }
 
     private final PaymentGateway gateway;
     private final ProviderRegistry providers;
     private final RetryingProviderCall retry;
-    private final PaymentStateService state;
+    private final CaptureIntentService captureIntentService;
+    private final FailIntentService failIntentService;
     private final Clock clock;
 
-    public ConfirmIntentUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry,
-                                PaymentStateService state, Clock clock) {
+    public ConfirmIntentUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry, CaptureIntentService captureIntentService, FailIntentService failIntentService, Clock clock) {
         this.gateway = gateway;
         this.providers = providers;
         this.retry = retry;
-        this.state = state;
+        this.captureIntentService = captureIntentService;
+        this.failIntentService = failIntentService;
         this.clock = clock;
     }
 
     @Override
-    public Response execute(Request request) {
-        var intent = gateway.findIntent(request.intentId())
-                .orElseThrow(() -> new PaymentNotFoundException(request.intentId()));
+    public ConfirmIntentUsecaseResponse execute(ConfirmIntentUsecaseRequest request) {
+        var intent = gateway.findIntent(request.getIntentId())
+                .orElseThrow(() -> new PaymentNotFoundException(request.getIntentId()));
         if (intent.status().wasCaptured()) {
-            return new Response(intent); // already paid: confirming again is a no-op
+            return new ConfirmIntentUsecaseResponse(intent); // already paid: confirming again is a no-op
         }
         if (intent.status() != PaymentStatus.REQUIRES_ACTION && intent.status() != PaymentStatus.AUTHORIZED) {
             throw new BusinessRuleViolationException("INVALID_PAYMENT_STATE",
@@ -66,7 +66,7 @@ public class ConfirmIntentUsecase implements Usecase<ConfirmIntentUsecase.Reques
         ChargeResult result;
         try {
             result = retry.call(() -> provider.confirm(new ConfirmCommand(intent.providerIntentId(),
-                    request.paymentMethodToken(), intent.idempotencyKey() + ":" + attemptNo)));
+                    request.getPaymentMethodToken(), intent.idempotencyKey() + ":" + attemptNo)));
         } catch (ProviderTransientException e) {
             gateway.insertAttempt(attempt(intent, attemptNo, null, "ERROR", e.getMessage()));
             throw new DependencyUnavailableException("Payment provider unavailable. Retry the confirmation.", e);
@@ -75,12 +75,12 @@ public class ConfirmIntentUsecase implements Usecase<ConfirmIntentUsecase.Reques
         }
 
         var outcome = result;
-        return new Response(gateway.inTransaction(() -> {
+        return new ConfirmIntentUsecaseResponse(gateway.inTransaction(() -> {
             gateway.insertAttempt(attempt(intent, attemptNo, outcome.providerChargeId(), outcome.outcome().name(),
                     outcome.rawResponse()));
             return switch (outcome.outcome()) {
-                case SUCCEEDED -> state.markCaptured(intent);
-                case DECLINED -> state.markFailed(intent, outcome.failureCode(), outcome.failureMessage());
+                case SUCCEEDED -> captureIntentService.execute(CaptureIntentServiceRequest.builder().intent(intent).build()).getIntent();
+                case DECLINED -> failIntentService.execute(FailIntentServiceRequest.builder().intent(intent).code(outcome.failureCode()).message(outcome.failureMessage()).build()).getIntent();
                 case REQUIRES_ACTION -> intent;
             };
         }));

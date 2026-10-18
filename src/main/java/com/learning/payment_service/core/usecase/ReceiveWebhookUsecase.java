@@ -17,16 +17,12 @@ import java.util.UUID;
  * retrying. Retries of the same event are detected by (provider, event id) and dropped. The event is applied
  * later by {@link ProcessWebhookEventsUsecase}.
  */
-public class ReceiveWebhookUsecase implements Usecase<ReceiveWebhookUsecase.Request, ReceiveWebhookUsecase.Response> {
+public class ReceiveWebhookUsecase implements Usecase<ReceiveWebhookUsecaseRequest, ReceiveWebhookUsecaseResponse> {
 
     /** Stays well under the 32767-character payload column. */
     static final int MAX_BODY_CHARS = 30_000;
 
-    public record Request(Provider provider, WebhookRequest webhook) implements UsecaseRequest {
-    }
 
-    public record Response(boolean duplicate) implements UsecaseResponse {
-    }
 
     private final WebhookHandlers handlers;
     private final WebhookEventGateway events;
@@ -39,20 +35,20 @@ public class ReceiveWebhookUsecase implements Usecase<ReceiveWebhookUsecase.Requ
     }
 
     @Override
-    public Response execute(Request request) {
-        var handler = handlers.get(request.provider());
-        if (!handler.verify(request.webhook())) {
+    public ReceiveWebhookUsecaseResponse execute(ReceiveWebhookUsecaseRequest request) {
+        var handler = handlers.get(request.getProvider());
+        if (!handler.verify(request.getWebhook())) {
             throw InvalidWebhookException.badSignature("Invalid webhook signature");
         }
-        String body = request.webhook().body();
+        String body = request.getWebhook().body();
         if (body.length() > MAX_BODY_CHARS) {
             throw InvalidWebhookException.malformed("Webhook body too large");
         }
-        String eventId = handler.eventId(request.webhook());
+        String eventId = handler.eventId(request.getWebhook());
         String type = handler.eventType(body);
-        var stored = events.insertIfAbsent(new WebhookEvent(UUID.randomUUID(), request.provider(), eventId,
+        var stored = events.insertIfAbsent(new WebhookEvent(UUID.randomUUID(), request.getProvider(), eventId,
                 type.length() > 60 ? type.substring(0, 60) : type, body, true, null,
                 OffsetDateTime.now(clock).withOffsetSameInstant(ZoneOffset.UTC)));
-        return new Response(!stored);
+        return new ReceiveWebhookUsecaseResponse(!stored);
     }
 }

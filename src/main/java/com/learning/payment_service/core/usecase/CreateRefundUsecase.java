@@ -1,5 +1,11 @@
 package com.learning.payment_service.core.usecase;
 
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundService;
+import com.learning.payment_service.core.service.refund.complete.CompleteRefundServiceRequest;
+import com.learning.payment_service.core.service.refund.fail.FailRefundService;
+import com.learning.payment_service.core.service.refund.fail.FailRefundServiceRequest;
+import com.learning.payment_service.core.service.outbox.OutboxService;
+import com.learning.payment_service.core.service.outbox.OutboxServiceRequest;
 import com.learning.payment_service.core.domain.PaymentIntent;
 import com.learning.payment_service.core.domain.Refund;
 import com.learning.payment_service.core.domain.RefundStatus;
@@ -8,8 +14,6 @@ import com.learning.payment_service.core.provider.ProviderRegistry;
 import com.learning.payment_service.core.provider.ProviderRejectedException;
 import com.learning.payment_service.core.provider.ProviderTransientException;
 import com.learning.payment_service.core.provider.RetryingProviderCall;
-import com.learning.payment_service.core.service.OutboxWriter;
-import com.learning.payment_service.core.service.PaymentStateService;
 import com.learning.payment_service.exception.BusinessRuleViolationException;
 import com.learning.payment_service.exception.DependencyUnavailableException;
 import com.learning.payment_service.exception.DuplicateIdempotencyKeyException;
@@ -28,39 +32,35 @@ import java.util.UUID;
  * as its own key. The refundable balance is captured amount minus refunds that are not FAILED; creating a refund
  * also bumps the intent's version, so two concurrent refunds cannot both pass the balance check.
  */
-public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request, CreateRefundUsecase.Response> {
+public class CreateRefundUsecase implements Usecase<CreateRefundUsecaseRequest, CreateRefundUsecaseResponse> {
 
-    public record Request(String idempotencyKey, UUID orderId, BigDecimal amount, String reason)
-            implements UsecaseRequest {
-    }
 
-    public record Response(Refund refund, PaymentIntent intent, boolean created) implements UsecaseResponse {
-    }
 
     private final PaymentGateway gateway;
     private final ProviderRegistry providers;
     private final RetryingProviderCall retry;
-    private final PaymentStateService state;
-    private final OutboxWriter outbox;
+    private final CompleteRefundService completeRefundService;
+    private final FailRefundService failRefundService;
+    private final OutboxService outboxService;
     private final Clock clock;
 
-    public CreateRefundUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry,
-                               PaymentStateService state, OutboxWriter outbox, Clock clock) {
+    public CreateRefundUsecase(PaymentGateway gateway, ProviderRegistry providers, RetryingProviderCall retry, CompleteRefundService completeRefundService, FailRefundService failRefundService, OutboxService outboxService, Clock clock) {
         this.gateway = gateway;
         this.providers = providers;
         this.retry = retry;
-        this.state = state;
-        this.outbox = outbox;
+        this.completeRefundService = completeRefundService;
+        this.failRefundService = failRefundService;
+        this.outboxService = outboxService;
         this.clock = clock;
     }
 
     @Override
-    public Response execute(Request request) {
+    public CreateRefundUsecaseResponse execute(CreateRefundUsecaseRequest request) {
         validate(request);
 
         Refund refund;
         boolean created;
-        var existing = gateway.findRefundByIdempotencyKey(request.idempotencyKey());
+        var existing = gateway.findRefundByIdempotencyKey(request.getIdempotencyKey());
         if (existing.isPresent()) {
             refund = requireSame(existing.get(), request);
             created = false;
@@ -69,7 +69,7 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
                 refund = insertNew(request);
                 created = true;
             } catch (DuplicateIdempotencyKeyException lostRace) {
-                refund = requireSame(gateway.findRefundByIdempotencyKey(request.idempotencyKey()).orElseThrow(), request);
+                refund = requireSame(gateway.findRefundByIdempotencyKey(request.getIdempotencyKey()).orElseThrow(), request);
                 created = false;
             }
         }
@@ -79,27 +79,27 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
             refund = submitToProvider(intent, refund);
             intent = gateway.findIntent(refund.intentId()).orElseThrow();
         }
-        return new Response(refund, intent, created);
+        return new CreateRefundUsecaseResponse(refund, intent, created);
     }
 
-    private Refund insertNew(Request request) {
-        var intents = gateway.findIntentsByOrder(request.orderId());
+    private Refund insertNew(CreateRefundUsecaseRequest request) {
+        var intents = gateway.findIntentsByOrder(request.getOrderId());
         var intent = intents.stream().filter(i -> i.status().isRefundable())
                 .max(Comparator.comparing(PaymentIntent::createdAt))
                 .orElseThrow(() -> intents.stream().anyMatch(i -> i.status().wasCaptured())
                         ? new BusinessRuleViolationException("REFUND_EXCEEDS_CAPTURED",
-                                "Order " + request.orderId() + " is already fully refunded")
+                                "Order " + request.getOrderId() + " is already fully refunded")
                         : new BusinessRuleViolationException("PAYMENT_NOT_CAPTURED",
-                                "Order " + request.orderId() + " has no captured payment to refund"));
+                                "Order " + request.getOrderId() + " has no captured payment to refund"));
 
         var remaining = intent.amount().subtract(gateway.sumReservedRefunds(intent.id()));
-        var amount = request.amount() != null ? request.amount() : remaining;
+        var amount = request.getAmount() != null ? request.getAmount() : remaining;
         if (amount.signum() <= 0 || amount.compareTo(remaining) > 0) {
             throw new BusinessRuleViolationException("REFUND_EXCEEDS_CAPTURED",
                     "Refund of " + amount + " exceeds the refundable balance of " + remaining);
         }
         var now = OffsetDateTime.now(clock).withOffsetSameInstant(ZoneOffset.UTC);
-        var refund = Refund.initiated(intent, amount, request.reason(), request.idempotencyKey(), now);
+        var refund = Refund.initiated(intent, amount, request.getReason(), request.getIdempotencyKey(), now);
         return gateway.inTransaction(() -> {
             gateway.updateIntent(intent.withStatus(intent.status(), now)); // version bump: serialises refunds
             var saved = gateway.insertRefund(refund);
@@ -108,7 +108,7 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
             data.put("refundId", saved.id().toString());
             data.put("amount", saved.amount());
             data.put("reason", saved.reason());
-            outbox.emit(saved.id(), "REFUND_INITIATED", data);
+            outboxService.execute(OutboxServiceRequest.builder().aggregateId(saved.id()).eventType("REFUND_INITIATED").data(data).build());
             return saved;
         });
     }
@@ -119,10 +119,10 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
             var result = retry.call(() -> provider.refund(new RefundCommand(intent.providerIntentId(),
                     refund.amount(), refund.currency(), refund.reason(), refund.idempotencyKey())));
             return switch (result.outcome()) {
-                case SUCCEEDED -> state.completeRefund(refund, result.providerRefundId());
+                case SUCCEEDED -> completeRefundService.execute(CompleteRefundServiceRequest.builder().refund(refund).providerRefundId(result.providerRefundId()).build()).getRefund();
                 case PROCESSING -> gateway.updateRefund(refund.processing(result.providerRefundId()));
                 case FAILED -> {
-                    state.failRefund(refund);
+                    failRefundService.execute(FailRefundServiceRequest.builder().refund(refund).build());
                     throw new BusinessRuleViolationException("REFUND_REJECTED", result.failureMessage());
                 }
             };
@@ -130,14 +130,14 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
             throw new DependencyUnavailableException(
                     "Payment provider unavailable. Retry with the same Idempotency-Key.", e);
         } catch (ProviderRejectedException e) {
-            state.failRefund(refund);
+            failRefundService.execute(FailRefundServiceRequest.builder().refund(refund).build());
             throw new BusinessRuleViolationException("REFUND_REJECTED", e.getMessage());
         }
     }
 
-    private static Refund requireSame(Refund existing, Request request) {
-        boolean same = existing.orderId().equals(request.orderId())
-                && (request.amount() == null || existing.amount().compareTo(request.amount()) == 0);
+    private static Refund requireSame(Refund existing, CreateRefundUsecaseRequest request) {
+        boolean same = existing.orderId().equals(request.getOrderId())
+                && (request.getAmount() == null || existing.amount().compareTo(request.getAmount()) == 0);
         if (!same) {
             throw new BusinessRuleViolationException("IDEMPOTENCY_KEY_REUSED",
                     "This Idempotency-Key was already used for a different refund request");
@@ -145,12 +145,12 @@ public class CreateRefundUsecase implements Usecase<CreateRefundUsecase.Request,
         return existing;
     }
 
-    private static void validate(Request r) {
-        if (r.idempotencyKey() == null || r.idempotencyKey().isBlank() || r.idempotencyKey().length() > 80) {
+    private static void validate(CreateRefundUsecaseRequest r) {
+        if (r.getIdempotencyKey() == null || r.getIdempotencyKey().isBlank() || r.getIdempotencyKey().length() > 80) {
             throw new BusinessRuleViolationException("INVALID_IDEMPOTENCY_KEY",
                     "Idempotency-Key is required and must be at most 80 characters");
         }
-        if (r.amount() != null && (r.amount().signum() <= 0 || r.amount().scale() > 4)) {
+        if (r.getAmount() != null && (r.getAmount().signum() <= 0 || r.getAmount().scale() > 4)) {
             throw new BusinessRuleViolationException("INVALID_AMOUNT",
                     "amount must be positive with at most 4 decimal places");
         }
