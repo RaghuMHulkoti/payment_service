@@ -1,4 +1,7 @@
 spring:
+  config:
+    # local runs: pick up RAZORPAY_* / STRIPE_* / KAFKA_* from a git-ignored .env file when one exists
+    import: optional:file:.env[.properties]
   application:
     name: payment-service
   kafka:
@@ -82,6 +85,9 @@ payment:
     api-key: ${STRIPE_SECRET_KEY:}
   razorpay:
     webhook-secret: ${RAZORPAY_WEBHOOK_SECRET:}
+    # Razorpay Standard Checkout keys from the environment (test keys: rzp_test_...). Empty = simulated.
+    key-id: ${RAZORPAY_KEY_ID:}
+    key-secret: ${RAZORPAY_KEY_SECRET:}
 
 springdoc:
   api-docs:
@@ -132,3 +138,7 @@ management:
       enabled: true
     readinessstate:
       enabled: true
+
+# Browser origins allowed to call this API (comma separated, e.g. the test console). Empty = none.
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:}

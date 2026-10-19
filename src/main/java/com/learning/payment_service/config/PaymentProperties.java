@@ -24,6 +24,11 @@ public record PaymentProperties(
                          @DefaultValue("") String apiKey) {
     }
 
-    public record Razorpay(@DefaultValue("") String webhookSecret) {
+    /**
+     * {@code keyId} is public (Checkout needs it in the browser); {@code keySecret} never leaves the server.
+     * Both empty keeps Razorpay simulated.
+     */
+    public record Razorpay(@DefaultValue("") String webhookSecret, @DefaultValue("") String keyId,
+                           @DefaultValue("") String keySecret) {
     }
 }

@@ -79,6 +79,13 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.UNPROCESSABLE_CONTENT, ex.getErrorCode(), ex.getMessage(), null);
     }
 
+    /** A Checkout signature that does not match is a bad request, and nothing is marked paid. */
+    @ExceptionHandler(InvalidSignatureException.class)
+    public ResponseEntity<Response<ErrorResponse>> handleBadSignature(InvalidSignatureException ex) {
+        log.warn("Rejected Razorpay checkout result: {}", ex.getMessage());
+        return build(HttpStatus.BAD_REQUEST, "INVALID_SIGNATURE", ex.getMessage(), null);
+    }
+
     @ExceptionHandler(ConflictException.class)
     public ResponseEntity<Response<ErrorResponse>> handleConflict(ConflictException ex) {
         return build(HttpStatus.CONFLICT, ex.getErrorCode(), ex.getMessage(), null);

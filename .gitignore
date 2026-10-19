@@ -3,3 +3,6 @@ target/
 HELP.md
 .idea/
 *.iml
+
+# local secrets
+.env

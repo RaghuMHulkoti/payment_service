@@ -6,7 +6,10 @@ import com.learning.payment_service.core.processor.ConfirmIntentProcessor;
 import com.learning.payment_service.core.processor.CreateIntentProcessor;
 import com.learning.payment_service.core.processor.CreateIntentProcessorResponse;
 import com.learning.payment_service.core.processor.CreateRefundProcessor;
+import com.learning.payment_service.core.processor.GetCheckoutProcessor;
 import com.learning.payment_service.core.processor.GetPaymentProcessor;
+import com.learning.payment_service.core.processor.VerifyRazorpayPaymentProcessor;
+import com.learning.payment_service.exception.InvalidSignatureException;
 import com.learning.payment_service.core.processor.ReceiveWebhookProcessor;
 import com.learning.payment_service.core.processor.ReceiveWebhookProcessorResponse;
 import com.learning.payment_service.exception.BusinessRuleViolationException;
@@ -39,14 +42,42 @@ class PaymentControllerTest {
     CreateIntentProcessor create = Mockito.mock(CreateIntentProcessor.class);
     GetPaymentProcessor getPayment = Mockito.mock(GetPaymentProcessor.class);
     ReceiveWebhookProcessor webhook = Mockito.mock(ReceiveWebhookProcessor.class);
+    GetCheckoutProcessor checkout = Mockito.mock(GetCheckoutProcessor.class);
+    VerifyRazorpayPaymentProcessor verify = Mockito.mock(VerifyRazorpayPaymentProcessor.class);
     MockMvc mvc;
 
     @BeforeEach
     void setUp() {
         var payments = new PaymentController(create, Mockito.mock(ConfirmIntentProcessor.class),
-                Mockito.mock(CreateRefundProcessor.class), getPayment);
+                Mockito.mock(CreateRefundProcessor.class), getPayment, checkout, verify);
         mvc = MockMvcBuilders.standaloneSetup(payments, new WebhookController(webhook))
                 .setControllerAdvice(new GlobalExceptionHandler()).build();
+    }
+
+    @Test
+    void verifyWithMissingFieldsIsABadRequest() throws Exception {
+        mvc.perform(post("/api/v1/payments/" + UUID.randomUUID() + "/razorpay/verify").header("X-User-Id", customer.toString())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"razorpay_order_id\":\"order_1\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.body.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void verifyWithAWrongSignatureIs400AndNothingIsPaid() throws Exception {
+        when(verify.process(any())).thenThrow(new InvalidSignatureException("Payment signature does not match"));
+
+        mvc.perform(post("/api/v1/payments/" + UUID.randomUUID() + "/razorpay/verify").header("X-User-Id", customer.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"razorpay_order_id\":\"order_1\",\"razorpay_payment_id\":\"pay_1\",\"razorpay_signature\":\"bad\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.body.errorCode").value("INVALID_SIGNATURE"));
+    }
+
+    @Test
+    void checkoutAndVerifyNeedTheCallerIdentity() throws Exception {
+        mvc.perform(get("/api/v1/payments/" + UUID.randomUUID() + "/checkout")).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/v1/payments/" + UUID.randomUUID() + "/razorpay/verify").contentType(MediaType.APPLICATION_JSON)
+                .content("{}")).andExpect(status().isUnauthorized());
     }
 
     @Test

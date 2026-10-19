@@ -2,7 +2,11 @@ package com.learning.payment_service.web;
 
 import com.learning.payment_service.core.processor.*;
 import com.learning.payment_service.common.StatusCode;
+import com.learning.payment_service.core.processor.GetCheckoutProcessor;
+import com.learning.payment_service.core.processor.VerifyRazorpayPaymentProcessor;
 import com.learning.payment_service.web.request.ConfirmIntentRequest;
+import com.learning.payment_service.web.request.VerifyRazorpayPaymentRequest;
+import com.learning.payment_service.web.response.CheckoutResponse;
 import com.learning.payment_service.web.request.CreateIntentRequest;
 import com.learning.payment_service.web.request.CreateRefundRequest;
 import com.learning.payment_service.web.response.PaymentResponse;
@@ -42,9 +46,15 @@ public class PaymentController {
     private final ConfirmIntentProcessor confirmIntentProcessor;
     private final CreateRefundProcessor createRefundProcessor;
     private final GetPaymentProcessor getPaymentProcessor;
+    private final GetCheckoutProcessor getCheckoutProcessor;
+    private final VerifyRazorpayPaymentProcessor verifyRazorpayPaymentProcessor;
 
     public PaymentController(CreateIntentProcessor createIntentProcessor, ConfirmIntentProcessor confirmIntentProcessor,
-                             CreateRefundProcessor createRefundProcessor, GetPaymentProcessor getPaymentProcessor) {
+                             CreateRefundProcessor createRefundProcessor, GetPaymentProcessor getPaymentProcessor,
+                             GetCheckoutProcessor getCheckoutProcessor,
+                             VerifyRazorpayPaymentProcessor verifyRazorpayPaymentProcessor) {
+        this.getCheckoutProcessor = getCheckoutProcessor;
+        this.verifyRazorpayPaymentProcessor = verifyRazorpayPaymentProcessor;
         this.createIntentProcessor = createIntentProcessor;
         this.confirmIntentProcessor = confirmIntentProcessor;
         this.createRefundProcessor = createRefundProcessor;
@@ -96,6 +106,25 @@ public class PaymentController {
         var result = getPaymentProcessor.process(new GetPaymentProcessorRequest(id, userId));
         return ok("Payment retrieved successfully",
                 PaymentResponseMapper.toResponse(result.getIntent(), null, result.getRefunds()));
+    }
+
+    @GetMapping("/payments/{id}/checkout")
+    @Operation(summary = "Razorpay Checkout details (public key id, Razorpay order id, amount in paise) for the paying customer")
+    public ResponseEntity<Response<CheckoutResponse>> checkout(
+            @Parameter(hidden = true) @RequestHeader(USER_HEADER) UUID userId, @PathVariable UUID id) {
+        var c = getCheckoutProcessor.process(new GetCheckoutProcessor.Request(id, userId)).checkout();
+        return ok("Checkout details retrieved", new CheckoutResponse(c.paymentId(), c.keyId(), c.razorpayOrderId(),
+                c.amountPaise(), c.currency()));
+    }
+
+    @PostMapping("/payments/{id}/razorpay/verify")
+    @Operation(summary = "Verify the Razorpay Checkout signature; only a matching signature marks the payment paid (400 otherwise)")
+    public ResponseEntity<Response<PaymentResponse>> verifyRazorpay(
+            @Parameter(hidden = true) @RequestHeader(USER_HEADER) UUID userId, @PathVariable UUID id,
+            @Valid @RequestBody VerifyRazorpayPaymentRequest request) {
+        var result = verifyRazorpayPaymentProcessor.process(new VerifyRazorpayPaymentProcessor.Request(id, userId,
+                request.razorpayOrderId(), request.razorpayPaymentId(), request.razorpaySignature()));
+        return ok("Payment verified", PaymentResponseMapper.toResponse(result.intent(), null, List.of()));
     }
 
     private static <T> ResponseEntity<Response<T>> ok(String message, T body) {

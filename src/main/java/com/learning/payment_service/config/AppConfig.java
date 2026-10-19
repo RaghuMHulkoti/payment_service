@@ -31,6 +31,12 @@ import com.learning.payment_service.gateway.PaymentAttemptRepository;
 import com.learning.payment_service.gateway.PaymentIntentRepository;
 import com.learning.payment_service.gateway.PaymentOutboxPoller;
 import com.learning.payment_service.gateway.PaymentOutboxRepository;
+import com.learning.payment_service.core.processor.GetCheckoutProcessor;
+import com.learning.payment_service.core.processor.VerifyRazorpayPaymentProcessor;
+import com.learning.payment_service.core.usecase.GetCheckoutUsecase;
+import com.learning.payment_service.core.usecase.VerifyRazorpayPaymentUsecase;
+import com.learning.payment_service.gateway.provider.RazorpayPaymentProvider;
+import org.springframework.beans.factory.ObjectProvider;
 import com.learning.payment_service.core.usecase.HandleOrderEndedUsecase;
 import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
 import com.learning.payment_service.gateway.provider.StripePaymentProvider;
@@ -207,12 +213,43 @@ public class AppConfig {
      * {@link PaymentProvider} and replace these beans without touching the use cases.
      */
     @Bean
-    public ProviderRegistry providerRegistry(PaymentProperties properties) {
+    public ProviderRegistry providerRegistry(PaymentProperties properties, ObjectProvider<RazorpayPaymentProvider> razorpay) {
         // Stripe talks to the real API (test mode with an sk_test key) once a key is configured; otherwise simulated
         PaymentProvider stripe = properties.stripe().apiKey().isBlank()
                 ? new SimulatedPaymentProvider(Provider.STRIPE)
                 : new StripePaymentProvider(new StripeClient(properties.stripe().apiKey()));
-        return new ProviderRegistry(List.of(stripe, new SimulatedPaymentProvider(Provider.RAZORPAY)));
+        // Razorpay Standard Checkout once both keys are configured; otherwise simulated
+        RazorpayPaymentProvider realRazorpay = razorpay.getIfAvailable();
+        PaymentProvider razorpayProvider = realRazorpay != null ? realRazorpay : new SimulatedPaymentProvider(Provider.RAZORPAY);
+        return new ProviderRegistry(List.of(stripe, razorpayProvider));
+    }
+
+    @Bean
+    @ConditionalOnExpression("!'${payment.razorpay.key-id:}'.isEmpty() and !'${payment.razorpay.key-secret:}'.isEmpty()")
+    public RazorpayPaymentProvider razorpayPaymentProvider(PaymentProperties properties) {
+        return new RazorpayPaymentProvider(properties.razorpay().keyId(), properties.razorpay().keySecret());
+    }
+
+    @Bean
+    public GetCheckoutUsecase getCheckoutUsecase(PaymentGateway gateway, ObjectProvider<RazorpayPaymentProvider> razorpay) {
+        return new GetCheckoutUsecase(gateway, razorpay.getIfAvailable());
+    }
+
+    @Bean
+    public VerifyRazorpayPaymentUsecase verifyRazorpayPaymentUsecase(PaymentGateway gateway,
+                                                                     ObjectProvider<RazorpayPaymentProvider> razorpay,
+                                                                     CaptureIntentService captureIntentService, Clock clock) {
+        return new VerifyRazorpayPaymentUsecase(gateway, razorpay.getIfAvailable(), captureIntentService, clock);
+    }
+
+    @Bean
+    public GetCheckoutProcessor getCheckoutProcessor(GetCheckoutUsecase usecase) {
+        return new GetCheckoutProcessor(usecase);
+    }
+
+    @Bean
+    public VerifyRazorpayPaymentProcessor verifyRazorpayPaymentProcessor(VerifyRazorpayPaymentUsecase usecase) {
+        return new VerifyRazorpayPaymentProcessor(usecase);
     }
 
     @Bean

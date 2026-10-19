@@ -20,7 +20,11 @@ import com.learning.payment_service.core.usecase.ConfirmIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateRefundUsecase;
 import com.learning.payment_service.core.usecase.GetPaymentUsecase;
+import com.learning.payment_service.core.usecase.GetCheckoutUsecase;
 import com.learning.payment_service.core.usecase.HandleOrderEndedUsecase;
+import com.learning.payment_service.core.usecase.VerifyRazorpayPaymentUsecase;
+import com.learning.payment_service.exception.InvalidSignatureException;
+import com.learning.payment_service.gateway.provider.RazorpayPaymentProvider;
 import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
 import com.learning.payment_service.core.usecase.ProcessWebhookEventsUsecase;
 import com.learning.payment_service.core.usecase.ReceiveWebhookUsecase;
@@ -564,6 +568,108 @@ class PaymentFlowTest {
         create("key-trace", "10.00", "USD");
         assertThat(jdbc.queryForList("SELECT payload FROM payment_outbox", String.class))
                 .allSatisfy(p -> assertThat(p).containsPattern("\"traceId\":\"[0-9a-f]{32}\""));
+    }
+
+    // ---------------------------------------------------------------- Razorpay Standard Checkout
+
+    static final String RZP_SECRET = "checkout_test_secret";
+    final RazorpayPaymentProvider checkoutProvider = new RazorpayPaymentProvider("rzp_test_unit", RZP_SECRET);
+
+    String rzpSignature(String orderId, String paymentId, String secret) throws Exception {
+        var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(), "HmacSHA256"));
+        return java.util.HexFormat.of().formatHex(mac.doFinal((orderId + "|" + paymentId).getBytes()));
+    }
+
+    VerifyRazorpayPaymentUsecase verifier(boolean configured) {
+        var json = JsonMapper.builder().build();
+        return new VerifyRazorpayPaymentUsecase(gateway, configured ? checkoutProvider : null,
+                new CaptureIntentService(gateway, new OutboxService(gateway, json, clock), clock), clock);
+    }
+
+    @Test
+    void checkoutDetailsCarryThePublicKeyOrderIdAndPaise() {
+        var intent = create("key-rzp", "1299.00", "INR").getIntent();
+
+        var details = new GetCheckoutUsecase(gateway, checkoutProvider)
+                .execute(new GetCheckoutUsecase.Request(intent.id(), customer));
+
+        assertThat(details.keyId()).isEqualTo("rzp_test_unit");
+        assertThat(details.razorpayOrderId()).isEqualTo(intent.providerIntentId());
+        assertThat(details.amountPaise()).isEqualTo(129900L);
+        assertThat(details.currency()).isEqualTo("INR");
+        assertThat(details.toString()).doesNotContain(RZP_SECRET);
+    }
+
+    @Test
+    void checkoutDetailsAreOnlyForTheOwnerAndWhileOpen() {
+        var intent = create("key-rzp-own", "1299.00", "INR").getIntent();
+
+        assertThatThrownBy(() -> new GetCheckoutUsecase(gateway, checkoutProvider)
+                .execute(new GetCheckoutUsecase.Request(intent.id(), UUID.randomUUID()))).hasMessageContaining(intent.id().toString());
+        endedHandler().execute(new HandleOrderEndedUsecase.Request(orderEvent("ORDER_CANCELLED")));
+        assertThatThrownBy(() -> new GetCheckoutUsecase(gateway, checkoutProvider)
+                .execute(new GetCheckoutUsecase.Request(intent.id(), customer))).hasMessageContaining("CANCELLED");
+    }
+
+    @Test
+    void aValidSignatureCapturesThePaymentAndEmitsPaymentSuccess() throws Exception {
+        var intent = create("key-rzp-ok", "1299.00", "INR").getIntent();
+        var orderId = intent.providerIntentId();
+
+        var result = verifier(true).execute(new VerifyRazorpayPaymentUsecase.Request(intent.id(), customer, orderId,
+                "pay_123", rzpSignature(orderId, "pay_123", RZP_SECRET)));
+
+        assertThat(result.intent().status()).isEqualTo(PaymentStatus.CAPTURED);
+        assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED", "PAYMENT_SUCCESS");
+        assertThat(jdbc.queryForObject("SELECT provider_charge_id FROM payment_attempts", String.class)).isEqualTo("pay_123");
+    }
+
+    @Test
+    void aWrongSignatureIsRejectedAndTheIntentIsLeftUntouched() throws Exception {
+        var intent = create("key-rzp-bad", "1299.00", "INR").getIntent();
+        var orderId = intent.providerIntentId();
+
+        assertThatThrownBy(() -> verifier(true).execute(new VerifyRazorpayPaymentUsecase.Request(intent.id(), customer, orderId,
+                "pay_123", rzpSignature(orderId, "pay_123", "forged_secret")))).isInstanceOf(InvalidSignatureException.class);
+
+        assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION);
+        assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED");
+    }
+
+    @Test
+    void aSignatureForAnotherRazorpayOrderIsRejected() throws Exception {
+        var intent = create("key-rzp-other", "1299.00", "INR").getIntent();
+
+        assertThatThrownBy(() -> verifier(true).execute(new VerifyRazorpayPaymentUsecase.Request(intent.id(), customer,
+                "order_someoneElses", "pay_1", rzpSignature("order_someoneElses", "pay_1", RZP_SECRET))))
+                .isInstanceOf(InvalidSignatureException.class);
+        assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION);
+    }
+
+    @Test
+    void verifyingTwiceCapturesOnce() throws Exception {
+        var intent = create("key-rzp-twice", "1299.00", "INR").getIntent();
+        var orderId = intent.providerIntentId();
+        var request = new VerifyRazorpayPaymentUsecase.Request(intent.id(), customer, orderId, "pay_9", rzpSignature(orderId, "pay_9", RZP_SECRET));
+
+        verifier(true).execute(request);
+        verifier(true).execute(request);
+
+        assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED", "PAYMENT_SUCCESS");
+    }
+
+    @Test
+    void anotherCustomerCannotVerifyAndAServiceWithoutKeysIsUnavailable() throws Exception {
+        var intent = create("key-rzp-auth", "1299.00", "INR").getIntent();
+        var orderId = intent.providerIntentId();
+        var signature = rzpSignature(orderId, "pay_1", RZP_SECRET);
+
+        assertThatThrownBy(() -> verifier(true).execute(new VerifyRazorpayPaymentUsecase.Request(intent.id(), UUID.randomUUID(),
+                orderId, "pay_1", signature))).hasMessageContaining(intent.id().toString());
+        assertThatThrownBy(() -> verifier(false).execute(new VerifyRazorpayPaymentUsecase.Request(intent.id(), customer,
+                orderId, "pay_1", signature))).hasMessageContaining("not configured");
+        assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION);
     }
 
     // ---------------------------------------------------------------- helpers
