@@ -29,7 +29,23 @@ import com.learning.payment_service.gateway.JpaPaymentGateway;
 import com.learning.payment_service.gateway.JpaWebhookEventGateway;
 import com.learning.payment_service.gateway.PaymentAttemptRepository;
 import com.learning.payment_service.gateway.PaymentIntentRepository;
+import com.learning.payment_service.gateway.PaymentOutboxPoller;
 import com.learning.payment_service.gateway.PaymentOutboxRepository;
+import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
+import com.learning.payment_service.gateway.messaging.EventPublisher;
+import com.learning.payment_service.gateway.messaging.OrderEventListener;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
+import com.learning.payment_service.gateway.messaging.KafkaEventPublisher;
+import com.learning.payment_service.gateway.messaging.LoggingEventPublisher;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.springframework.kafka.config.TopicBuilder;
+import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.kafka.core.KafkaTemplate;
 import com.learning.payment_service.gateway.RefundRepository;
 import com.learning.payment_service.gateway.WebhookEventRepository;
 import com.learning.payment_service.gateway.PaymentGateway;
@@ -221,6 +237,76 @@ public class AppConfig {
     @ConditionalOnProperty(name = "payment.jobs.enabled", havingValue = "true", matchIfMissing = true)
     public ReconciliationJob reconciliationJob(ReconcileStuckIntentsUsecase usecase, PaymentProperties properties) {
         return new ReconciliationJob(usecase, properties);
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "payment.jobs.enabled", havingValue = "true", matchIfMissing = true)
+    public PaymentOutboxPoller paymentOutboxPoller(PaymentOutboxRepository outbox, EventPublisher publisher,
+                                                   PlatformTransactionManager transactionManager, JsonMapper json,
+                                                   Clock clock, @Value("${payment.outbox.batch-size:100}") int batchSize) {
+        return new PaymentOutboxPoller(outbox, publisher, new TransactionTemplate(transactionManager), json, clock,
+                batchSize);
+    }
+
+    // =========================================================================
+    // Events
+    // =========================================================================
+
+    @Bean
+    public HandlePaymentRequestedUsecase handlePaymentRequestedUsecase(CreateIntentUsecase createIntent,
+                                                                       OutboxService outboxService, JsonMapper json) {
+        return new HandlePaymentRequestedUsecase(createIntent, outboxService, json);
+    }
+
+    /** Off by default, so the service runs without a broker (the REST intent endpoint keeps working). */
+    @Bean
+    @ConditionalOnProperty(name = "payment.events.consumer-enabled", havingValue = "true")
+    public OrderEventListener orderEventListener(HandlePaymentRequestedUsecase usecase) {
+        return new OrderEventListener(usecase);
+    }
+
+    /**
+     * Creates the topic this service owns at startup, with an explicit small partition count so the cluster quota holds
+     * (free tier: 10 topics, 64 partitions in total). Replication is left to the broker default. The dead-letter topic
+     * of the order events it consumes, {@code domain.order.events.dlq}, is created by Inventory Service (same name).
+     */
+    @Bean
+    @ConditionalOnExpression("('${payment.events.publisher:log}' == 'kafka' or '${payment.events.consumer-enabled:false}' == 'true')"
+            + " and '${payment.events.create-topics:true}' == 'true'")
+    public KafkaAdmin.NewTopics paymentEventTopics(
+            @Value("${payment.events.topic:domain.payment.events}") String paymentTopic,
+            @Value("${payment.events.partitions:3}") int partitions) {
+        return new KafkaAdmin.NewTopics(ownedTopics(paymentTopic, partitions).toArray(NewTopic[]::new));
+    }
+
+    static List<NewTopic> ownedTopics(String paymentTopic, int partitions) {
+        return List.of(TopicBuilder.name(paymentTopic).partitions(partitions).build());
+    }
+
+    /** Retries 50ms, 250ms, 1.25s (TDD §13.7), then parks the event on {@code <topic>.dlq} and moves on. */
+    @Bean
+    @ConditionalOnProperty(name = "payment.events.consumer-enabled", havingValue = "true")
+    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+        var backOff = new ExponentialBackOffWithMaxRetries(3);
+        backOff.setInitialInterval(50);
+        backOff.setMultiplier(5);
+        var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, e) -> new TopicPartition(record.topic() + ".dlq", -1));
+        return new DefaultErrorHandler(recoverer, backOff);
+    }
+
+    /** {@code payment.events.publisher=kafka} sends to the broker; the default only logs. */
+    @Bean
+    @ConditionalOnProperty(name = "payment.events.publisher", havingValue = "kafka")
+    public EventPublisher kafkaEventPublisher(KafkaTemplate<String, String> kafkaTemplate,
+                                              @Value("${payment.events.topic:domain.payment.events}") String topic) {
+        return new KafkaEventPublisher(kafkaTemplate, topic);
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "payment.events.publisher", havingValue = "log", matchIfMissing = true)
+    public EventPublisher loggingEventPublisher() {
+        return new LoggingEventPublisher();
     }
 
     // =========================================================================

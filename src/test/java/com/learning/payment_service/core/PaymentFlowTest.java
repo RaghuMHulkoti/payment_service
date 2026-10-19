@@ -20,6 +20,7 @@ import com.learning.payment_service.core.usecase.ConfirmIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateRefundUsecase;
 import com.learning.payment_service.core.usecase.GetPaymentUsecase;
+import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
 import com.learning.payment_service.core.usecase.ProcessWebhookEventsUsecase;
 import com.learning.payment_service.core.usecase.ReceiveWebhookUsecase;
 import com.learning.payment_service.core.usecase.ReconcileStuckIntentsUsecase;
@@ -68,7 +69,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         "spring.flyway.enabled=false",
         "spring.jpa.properties.hibernate.default_schema=PUBLIC",
         "spring.sql.init.mode=always",
-        "spring.sql.init.schema-locations=classpath:db/migration/V1__create_payment_schema.sql",
+        "spring.sql.init.schema-locations=classpath:db/migration/V1__create_payment_schema.sql,classpath:db/migration/V2__outbox_relay.sql",
         "payment.jobs.enabled=false"
 })
 class PaymentFlowTest {
@@ -443,7 +444,109 @@ class PaymentFlowTest {
         assertThat(status(intent.id())).isEqualTo(PaymentStatus.REQUIRES_ACTION);
     }
 
+    // ---------------------------------------------------------------- outbox relay
+
+    @Test
+    void relayPublishesPendingEventsKeyedByOrderIdAndMarksThemSent() {
+        create("key-relay", "1299.00", "INR");
+        var sent = new java.util.ArrayList<String>();
+        var poller = poller((key, type, payload) -> sent.add(key + "|" + type));
+
+        assertThat(poller.publishBatch()).isEqualTo(1);
+        assertThat(sent).containsExactly(order + "|PAYMENT_INITIATED");
+        assertThat(jdbc.queryForObject("SELECT status FROM payment_outbox", String.class)).isEqualTo("SENT");
+        assertThat(poller.publishBatch()).isZero();
+    }
+
+    @Test
+    void relayLeavesTheEventPendingWhenTheBrokerIsDown() {
+        create("key-down", "1299.00", "INR");
+        var poller = poller((key, type, payload) -> {
+            throw new IllegalStateException("broker down");
+        });
+
+        assertThat(poller.publishBatch()).isZero();
+        assertThat(jdbc.queryForObject("SELECT status FROM payment_outbox", String.class)).isEqualTo("PENDING");
+        assertThat(jdbc.queryForObject("SELECT attempts FROM payment_outbox", Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void relayFailsAnEventTheBrokerWillNeverAccept() {
+        create("key-bad", "1299.00", "INR");
+        var poller = poller((key, type, payload) -> {
+            throw new com.learning.payment_service.gateway.messaging.NonRetryablePublishException("too large", null);
+        });
+
+        poller.publishBatch();
+
+        assertThat(jdbc.queryForObject("SELECT status FROM payment_outbox", String.class)).isEqualTo("FAILED");
+    }
+
+    // ---------------------------------------------------------------- PAYMENT_REQUESTED from Order Service
+
+    @Test
+    void paymentRequestedOpensTheIntentUnderTheOrderKeyAndRedeliveryChangesNothing() {
+        var handler = requestedHandler();
+
+        var first = handler.execute(new HandlePaymentRequestedUsecase.Request(paymentRequested("1299.00", "INR")));
+        var again = handler.execute(new HandlePaymentRequestedUsecase.Request(paymentRequested("1299.00", "INR")));
+
+        assertThat(first.outcome()).isEqualTo(HandlePaymentRequestedUsecase.Outcome.INTENT_OPEN);
+        assertThat(again.outcome()).isEqualTo(HandlePaymentRequestedUsecase.Outcome.INTENT_OPEN);
+        assertThat(jdbc.queryForObject("SELECT idempotency_key FROM payment_intents", String.class)).isEqualTo("order_" + order);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM payment_intents", Integer.class)).isEqualTo(1);
+        assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED");
+    }
+
+    @Test
+    void paymentRequestedForAnAlreadyPaidOrderIsRefusedAndReportedAsPaymentFailed() {
+        capture("key-first", "1299.00");
+
+        var result = requestedHandler().execute(new HandlePaymentRequestedUsecase.Request(paymentRequested("1299.00", "INR")));
+
+        assertThat(result.outcome()).isEqualTo(HandlePaymentRequestedUsecase.Outcome.REFUSED);
+        var failed = outboxPayload("PAYMENT_FAILED");
+        assertThat(failed).contains(order.toString()).contains("ORDER_ALREADY_PAID");
+    }
+
+    @Test
+    void otherOrderEventsAreIgnored() {
+        var result = requestedHandler().execute(new HandlePaymentRequestedUsecase.Request(
+                "{\"eventType\":\"ORDER_CREATED\",\"data\":{}}"));
+
+        assertThat(result.outcome()).isEqualTo(HandlePaymentRequestedUsecase.Outcome.IGNORED);
+        assertThat(outboxTypes()).isEmpty();
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    @Autowired
+    com.learning.payment_service.gateway.PaymentOutboxRepository outboxRepository;
+    @Autowired
+    org.springframework.transaction.PlatformTransactionManager txManager;
+
+    /** The relay under test; {@code publishBatch} needs the caller's transaction for the row lock. */
+    PaymentOutboxPollerHarness poller(com.learning.payment_service.gateway.messaging.EventPublisher publisher) {
+        var inner = new com.learning.payment_service.gateway.PaymentOutboxPoller(outboxRepository, publisher,
+                new org.springframework.transaction.support.TransactionTemplate(txManager), JsonMapper.builder().build(),
+                clock, 100);
+        return () -> inner.runOnce();
+    }
+
+    interface PaymentOutboxPollerHarness {
+        int publishBatch();
+    }
+
+    HandlePaymentRequestedUsecase requestedHandler() {
+        var json = JsonMapper.builder().build();
+        return new HandlePaymentRequestedUsecase(createIntent, new OutboxService(gateway, json, clock), json);
+    }
+
+    String paymentRequested(String amount, String currency) {
+        return "{\"eventId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"PAYMENT_REQUESTED\",\"data\":{\"orderId\":\""
+                + order + "\",\"customerId\":\"" + customer + "\",\"amount\":" + amount + ",\"currency\":\""
+                + currency + "\",\"provider\":null}}";
+    }
 
     CreateIntentUsecaseResponse create(String key, String amount, String currency) {
         return createIntent.execute(new CreateIntentUsecaseRequest(key, order, customer, new BigDecimal(amount), currency, null));
