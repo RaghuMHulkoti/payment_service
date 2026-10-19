@@ -230,3 +230,7 @@ erDiagram
 - `/api/v1/internal/**` has no authentication yet.
 - Payouts to suppliers are not implemented (the table exists).
 - Webhook URLs are not registered with the providers yet, so status comes from the API and reconciliation.
+
+## License
+
+Copyright (c) 2026 Raghavendra. All rights reserved. The code is published for viewing only; copying or reuse requires written permission. See [LICENSE](LICENSE).
