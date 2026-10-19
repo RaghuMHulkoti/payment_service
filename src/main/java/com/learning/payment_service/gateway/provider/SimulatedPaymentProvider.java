@@ -81,6 +81,12 @@ public class SimulatedPaymentProvider implements PaymentProvider {
     }
 
     @Override
+    public void cancel(String providerIntentId, String idempotencyKey) {
+        statusByIntent.computeIfPresent(providerIntentId,
+                (id, status) -> status == ProviderIntentStatus.SUCCEEDED ? status : ProviderIntentStatus.CANCELLED);
+    }
+
+    @Override
     public Optional<ProviderIntentStatus> fetchStatus(String providerIntentId) {
         return Optional.ofNullable(statusByIntent.get(providerIntentId));
     }

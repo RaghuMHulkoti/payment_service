@@ -2,6 +2,7 @@ package com.learning.payment_service.core.service.outbox;
 
 import com.learning.payment_service.core.service.Service;
 import com.learning.payment_service.core.service.ServiceSupport;
+import com.learning.payment_service.core.service.Tracing;
 import com.learning.payment_service.gateway.PaymentGateway;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -35,6 +36,7 @@ public class OutboxService implements Service<OutboxServiceRequest, OutboxServic
         envelope.put("eventType", request.getEventType());
         envelope.put("occurredAt", now.toString());
         envelope.put("producer", PRODUCER);
+        envelope.put("traceId", Tracing.current());
         envelope.put("version", 1);
         envelope.put("data", request.getData());
         gateway.insertOutbox(request.getAggregateId(), request.getEventType(),

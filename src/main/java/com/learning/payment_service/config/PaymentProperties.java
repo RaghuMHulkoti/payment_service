@@ -19,7 +19,9 @@ public record PaymentProperties(
                        @DefaultValue("15m") Duration reconcileInterval) {
     }
 
-    public record Stripe(@DefaultValue("") String webhookSecret, @DefaultValue("5m") Duration webhookTolerance) {
+    /** {@code apiKey}: the Stripe secret key (a test key {@code sk_test_...} in test mode); empty keeps Stripe simulated. */
+    public record Stripe(@DefaultValue("") String webhookSecret, @DefaultValue("5m") Duration webhookTolerance,
+                         @DefaultValue("") String apiKey) {
     }
 
     public record Razorpay(@DefaultValue("") String webhookSecret) {

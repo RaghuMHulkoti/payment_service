@@ -20,6 +20,7 @@ import com.learning.payment_service.core.usecase.ConfirmIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateIntentUsecase;
 import com.learning.payment_service.core.usecase.CreateRefundUsecase;
 import com.learning.payment_service.core.usecase.GetPaymentUsecase;
+import com.learning.payment_service.core.usecase.HandleOrderEndedUsecase;
 import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
 import com.learning.payment_service.core.usecase.ProcessWebhookEventsUsecase;
 import com.learning.payment_service.core.usecase.ReceiveWebhookUsecase;
@@ -518,6 +519,53 @@ class PaymentFlowTest {
         assertThat(outboxTypes()).isEmpty();
     }
 
+    // ---------------------------------------------------------------- order ended / trace id
+
+    @Test
+    void cancelledOrderClosesItsOpenIntentSoItCanNoLongerBePaid() {
+        var intent = create("key-end", "1299.00", "INR").getIntent();
+
+        var first = endedHandler().execute(new HandleOrderEndedUsecase.Request(orderEvent("ORDER_CANCELLED")));
+        var again = endedHandler().execute(new HandleOrderEndedUsecase.Request(orderEvent("ORDER_CANCELLED")));
+
+        assertThat(first.cancelled()).isEqualTo(1);
+        assertThat(again.cancelled()).isZero();
+        assertThat(status(intent.id())).isEqualTo(PaymentStatus.CANCELLED);
+        assertThat(razorpay.fetchStatus(intent.providerIntentId())).contains(PaymentProvider.ProviderIntentStatus.CANCELLED);
+        assertThat(outboxTypes()).containsExactly("PAYMENT_INITIATED", "PAYMENT_FAILED");
+        assertThatThrownBy(() -> confirm(intent.id(), "tok_ok")).hasMessageContaining("CANCELLED");
+    }
+
+    @Test
+    void anOrderEndingNeverTouchesAnIntentThatWasAlreadyPaid() {
+        capture("key-paid", "1299.00");
+
+        var result = endedHandler().execute(new HandleOrderEndedUsecase.Request(orderEvent("ORDER_FAILED")));
+
+        assertThat(result.cancelled()).isZero();
+        assertThat(outboxTypes()).doesNotContain("PAYMENT_FAILED");
+    }
+
+    @Test
+    void otherOrderEventsDoNotCancelAnything() {
+        create("key-keep", "1299.00", "INR");
+
+        var result = endedHandler().execute(new HandleOrderEndedUsecase.Request(orderEvent("ORDER_CONFIRMED")));
+
+        assertThat(result.cancelled()).isZero();
+    }
+
+    @Test
+    void everyEventCarriesATraceIdAndAHandlerKeepsTheIncomingOne() {
+        requestedHandler().execute(new HandlePaymentRequestedUsecase.Request(
+                paymentRequested("1299.00", "INR").replace("\"eventType\"", "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"eventType\"")));
+
+        assertThat(outboxPayload("PAYMENT_INITIATED")).contains("\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\"");
+        create("key-trace", "10.00", "USD");
+        assertThat(jdbc.queryForList("SELECT payload FROM payment_outbox", String.class))
+                .allSatisfy(p -> assertThat(p).containsPattern("\"traceId\":\"[0-9a-f]{32}\""));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     @Autowired
@@ -535,6 +583,17 @@ class PaymentFlowTest {
 
     interface PaymentOutboxPollerHarness {
         int publishBatch();
+    }
+
+    HandleOrderEndedUsecase endedHandler() {
+        var json = JsonMapper.builder().build();
+        return new HandleOrderEndedUsecase(gateway, new ProviderRegistry(List.<PaymentProvider>of(stripe, razorpay)),
+                new RetryingProviderCall(3, Duration.ZERO),
+                new CancelIntentService(gateway, new OutboxService(gateway, json, clock), clock), json);
+    }
+
+    String orderEvent(String type) {
+        return "{\"eventId\":\"" + UUID.randomUUID() + "\",\"eventType\":\"" + type + "\",\"data\":{\"orderId\":\"" + order + "\"}}";
     }
 
     HandlePaymentRequestedUsecase requestedHandler() {

@@ -25,6 +25,9 @@ public interface PaymentProvider {
 
     RefundResult refund(RefundCommand command);
 
+    /** Cancels an intent that has not been paid, so the customer can no longer pay it. Idempotent per key. */
+    void cancel(String providerIntentId, String idempotencyKey);
+
     /** The PSP's canonical view of an intent, used by reconciliation. Empty when the PSP does not know it. */
     Optional<ProviderIntentStatus> fetchStatus(String providerIntentId);
 

@@ -1,19 +1,26 @@
 package com.learning.payment_service.gateway.messaging;
 
+import com.learning.payment_service.core.usecase.HandleOrderEndedUsecase;
 import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
 import org.springframework.kafka.annotation.KafkaListener;
 
-/** Feeds Order Service's events into payment creation. Failures propagate so the error handler retries, then dead-letters. */
+/**
+ * Feeds Order Service's events into payments: PAYMENT_REQUESTED opens an intent, ORDER_CANCELLED / ORDER_FAILED close
+ * the open ones. Each handler ignores the other's events. Failures propagate so the error handler retries, then dead-letters.
+ */
 public class OrderEventListener {
 
-    private final HandlePaymentRequestedUsecase usecase;
+    private final HandlePaymentRequestedUsecase requested;
+    private final HandleOrderEndedUsecase ended;
 
-    public OrderEventListener(HandlePaymentRequestedUsecase usecase) {
-        this.usecase = usecase;
+    public OrderEventListener(HandlePaymentRequestedUsecase requested, HandleOrderEndedUsecase ended) {
+        this.requested = requested;
+        this.ended = ended;
     }
 
     @KafkaListener(topics = "${payment.events.order-topic:domain.order.events}", groupId = "${spring.kafka.consumer.group-id:payment-service}")
     public void onOrderEvent(String payload) {
-        usecase.execute(new HandlePaymentRequestedUsecase.Request(payload));
+        requested.execute(new HandlePaymentRequestedUsecase.Request(payload));
+        ended.execute(new HandleOrderEndedUsecase.Request(payload));
     }
 }

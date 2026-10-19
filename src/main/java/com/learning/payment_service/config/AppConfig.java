@@ -31,7 +31,10 @@ import com.learning.payment_service.gateway.PaymentAttemptRepository;
 import com.learning.payment_service.gateway.PaymentIntentRepository;
 import com.learning.payment_service.gateway.PaymentOutboxPoller;
 import com.learning.payment_service.gateway.PaymentOutboxRepository;
+import com.learning.payment_service.core.usecase.HandleOrderEndedUsecase;
 import com.learning.payment_service.core.usecase.HandlePaymentRequestedUsecase;
+import com.learning.payment_service.gateway.provider.StripePaymentProvider;
+import com.stripe.StripeClient;
 import com.learning.payment_service.gateway.messaging.EventPublisher;
 import com.learning.payment_service.gateway.messaging.OrderEventListener;
 import org.apache.kafka.common.TopicPartition;
@@ -204,9 +207,12 @@ public class AppConfig {
      * {@link PaymentProvider} and replace these beans without touching the use cases.
      */
     @Bean
-    public ProviderRegistry providerRegistry() {
-        return new ProviderRegistry(List.of(
-                new SimulatedPaymentProvider(Provider.STRIPE), new SimulatedPaymentProvider(Provider.RAZORPAY)));
+    public ProviderRegistry providerRegistry(PaymentProperties properties) {
+        // Stripe talks to the real API (test mode with an sk_test key) once a key is configured; otherwise simulated
+        PaymentProvider stripe = properties.stripe().apiKey().isBlank()
+                ? new SimulatedPaymentProvider(Provider.STRIPE)
+                : new StripePaymentProvider(new StripeClient(properties.stripe().apiKey()));
+        return new ProviderRegistry(List.of(stripe, new SimulatedPaymentProvider(Provider.RAZORPAY)));
     }
 
     @Bean
@@ -258,11 +264,18 @@ public class AppConfig {
         return new HandlePaymentRequestedUsecase(createIntent, outboxService, json);
     }
 
+    @Bean
+    public HandleOrderEndedUsecase handleOrderEndedUsecase(PaymentGateway gateway, ProviderRegistry providers,
+                                                           RetryingProviderCall retry, CancelIntentService cancelIntent,
+                                                           JsonMapper json) {
+        return new HandleOrderEndedUsecase(gateway, providers, retry, cancelIntent, json);
+    }
+
     /** Off by default, so the service runs without a broker (the REST intent endpoint keeps working). */
     @Bean
     @ConditionalOnProperty(name = "payment.events.consumer-enabled", havingValue = "true")
-    public OrderEventListener orderEventListener(HandlePaymentRequestedUsecase usecase) {
-        return new OrderEventListener(usecase);
+    public OrderEventListener orderEventListener(HandlePaymentRequestedUsecase requested, HandleOrderEndedUsecase ended) {
+        return new OrderEventListener(requested, ended);
     }
 
     /**
