@@ -12,7 +12,7 @@ public class OpenApiConfig {
     public OpenAPI paymentServiceOpenAPI() {
         return new OpenAPI()
                 .info(new Info()
-                        .title("Payment Service API")
+                        .title("ShopTrail Payment Service API")
                         .description("Payment intents, attempts, refunds and PSP webhook reconciliation. Payments live in Oracle "
                                 + "(schema PAYMENT). Card data is never stored: it is tokenised at the PSP. Every mutation takes an "
                                 + "Idempotency-Key. Webhooks are authenticated by signature, not by user.")
