@@ -2,7 +2,7 @@
 
 Payments for ShopTrail: payment intents, Stripe and Razorpay (test mode), refunds, webhooks and reconciliation.
 
-Part of **ShopTrail**, a multi-seller marketplace. Full system reference: [`marketplace_tdd.md`](https://github.com/RaghuMHulkoti/inventory-manager/blob/main/marketplace_tdd.md).
+Part of **ShopTrail**, a multi-seller marketplace. Full system reference: [`marketplace_tdd.md`](https://github.com/RaghuMHulkoti/shoptrail/blob/main/docs/marketplace_tdd.md).
 
 | | |
 |---|---|
@@ -107,7 +107,7 @@ Responses are wrapped as `{"status", "message", "body"}`. Only test keys are use
 
 ## Data model
 
-Schema `PAYMENT`. Full columns and constraints: [section 8 of the reference](https://github.com/RaghuMHulkoti/inventory-manager/blob/main/marketplace_tdd.md#8-data-model).
+Schema `PAYMENT`. Full columns and constraints: [section 8 of the reference](https://github.com/RaghuMHulkoti/shoptrail/blob/main/docs/marketplace_tdd.md#8-data-model).
 
 ```mermaid
 erDiagram
